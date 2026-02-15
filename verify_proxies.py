@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # --- 配置区 ---
 IPINFO_TOKEN = "bb8e53e4d8d6a1"
 TARGET_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.json"
-MAX_WORKERS = 30   # 并发线程数（GA 环境建议 20–40，过大易触发出口限流/连接失败）
+MAX_WORKERS = 40   # 并发线程数（GA 环境建议 20–40，过大易触发出口限流/连接失败）
 TIMEOUT = 5        # 单次检测超时(秒)
 MAX_LATENCY_MS = 500  # 仅保留延迟低于此值的节点
 SOCKS5_CHECK_TARGET = ("1.1.1.1", 80)
@@ -22,12 +22,7 @@ def get_real_geo(ip):
         resp = requests.get(url, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            country = data.get('country', '未知')
-            city = data.get('city', '')
-            # 如果城市名存在且不等于国家代码，则拼接
-            if city and city.lower() != country.lower() and city != "Unknown":
-                return f"{country}-{city}"
-            return country
+            return data.get('country', '未知')
     except:
         pass
     return "未知"
@@ -160,7 +155,6 @@ def socks5_connect_only(host, port, user, passwd, timeout):
 def process_node(item):
     raw_proxy = item['proxy']
     orig_country = item.get('country', 'ZZ')
-    orig_city = item.get('city', '')
 
     parts = parse_socks5_parts(raw_proxy)
     if not parts:
@@ -181,7 +175,7 @@ def process_node(item):
         if orig_country.upper() in ["ZZ", "UNKNOWN", "未知"]:
             label = get_real_geo(out_ip)
         else:
-            label = f"{orig_country}-{orig_city}" if (orig_city and orig_city != "Unknown") else orig_country
+            label = orig_country
         return True, f"{raw_proxy}#{label}", out_ip, latency_ms
     except Exception:
         pass
@@ -201,8 +195,7 @@ def main():
             if p and p not in seen_proxies:
                 tasks.append({
                     "proxy": p,
-                    "country": item.get('geolocation', {}).get('country', 'ZZ'),
-                    "city": item.get('geolocation', {}).get('city', '')
+                    "country": item.get('geolocation', {}).get('country', 'ZZ')
                 })
                 seen_proxies.add(p)
     except Exception as e:
