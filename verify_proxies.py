@@ -11,8 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 IPINFO_TOKEN = "bb8e53e4d8d6a1"
 TARGET_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.json"
 MAX_WORKERS = 40   # 并发线程数（GA 环境建议 20–40，过大易触发出口限流/连接失败）
-TIMEOUT = 5        # 单次检测超时(秒)
-MAX_LATENCY_MS = 500  # 仅保留延迟低于此值的节点
+TIMEOUT = 1        # 单次检测超时(秒)
 SOCKS5_CHECK_TARGET = ("1.1.1.1", 80)
 
 def get_real_geo(ip):
@@ -161,7 +160,7 @@ def process_node(item):
         return False, None, None, 0
     host, port, user, passwd = parts
     ok, latency_ms = socks5_connect_only(host, port, user, passwd, TIMEOUT)
-    if not ok or latency_ms >= MAX_LATENCY_MS:
+    if not ok:
         return False, None, None, 0
 
     # 用 parts 拼回 URL，走代理请求 ipify 取出口 IP 并打标签
