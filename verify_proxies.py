@@ -220,16 +220,8 @@ def main():
     with open("valid_proxies.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(valid_results))
 
-    # 2. 保存为 JSON (包含更多统计信息)
-    with open("valid_proxies.json", "w", encoding="utf-8") as f:
-        json.dump({
-            "update_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "total_valid": len(valid_results),
-            "proxies": valid_results
-        }, f, indent=4, ensure_ascii=False)
-
     print(f"\n✨ 验证完成！可用节点: {len(valid_results)}")
-    print(f"📂 结果已保存至 valid_proxies.txt 和 valid_proxies.json")
+    print(f"📂 结果已保存至 valid_proxies.txt")
 
 if __name__ == "__main__":
     main()
