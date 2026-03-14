@@ -13,6 +13,8 @@ TARGET_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/pr
 MAX_WORKERS = 40   # 并发线程数（GA 环境建议 20–40，过大易触发出口限流/连接失败）
 TIMEOUT = 1        # 单次检测超时(秒)
 SOCKS5_CHECK_TARGET = ("1.1.1.1", 80)
+CLOUDFLARE_IP_API = "https://www.wetest.vip/api/cf2dns/get_cloudflare_ip?key=o1zrmHAF&type=v4"
+OUTPUT_FILE = "cfyxip.txt"
 
 def get_real_geo(ip):
     """使用 ipinfo.io 获取高精度地理位置"""
@@ -151,6 +153,40 @@ def socks5_connect_only(host, port, user, passwd, timeout):
         except Exception:
             pass
 
+def format_cloudflare_ip(ip_info):
+    """格式化 Cloudflare IP 信息为指定格式"""
+    ip = ip_info.get('ip')
+    line_name = ip_info.get('line_name')
+    colo = ip_info.get('colo')
+    return f"{ip}:443#{line_name}-{colo}"
+
+def fetch_cloudflare_ips():
+    """获取并解析 Cloudflare IP 数据"""
+    print("🚀 正在获取 Cloudflare 优选 IP...")
+    try:
+        resp = requests.get(CLOUDFLARE_IP_API, timeout=15)
+        if resp.status_code != 200:
+            print(f"❌ 获取失败: HTTP {resp.status_code}")
+            return []
+        data = resp.json()
+        if not data.get('status'):
+            print(f"❌ 获取失败: {data.get('msg', '未知错误')}")
+            return []
+        
+        # 提取所有线路的 IP 信息
+        all_ips = []
+        info = data.get('info', {})
+        for line_type, ip_list in info.items():
+            for ip_info in ip_list:
+                formatted = format_cloudflare_ip(ip_info)
+                all_ips.append(formatted)
+        
+        print(f"✅ 成功获取 {len(all_ips)} 个 Cloudflare IP")
+        return all_ips
+    except Exception as e:
+        print(f"❌ 获取失败: {e}")
+        return []
+
 def process_node(item):
     raw_proxy = item['proxy']
     orig_country = item.get('country', 'ZZ')
@@ -181,7 +217,15 @@ def process_node(item):
     return False, None, None, 0
 
 def main():
-    print(f"🚀 正在从源获取代理列表...")
+    # 获取 Cloudflare 优选 IP
+    cloudflare_ips = fetch_cloudflare_ips()
+    if cloudflare_ips:
+        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(cloudflare_ips))
+        print(f"📂 Cloudflare 优选 IP 已保存至 {OUTPUT_FILE}")
+    
+    # 原有代理验证功能
+    print(f"\n🚀 正在从源获取代理列表...")
     try:
         resp = requests.get(TARGET_URL, timeout=15)
         raw_list = resp.json()
@@ -215,8 +259,7 @@ def main():
                 print(f"✅ 有效: {out_ip} [{geo_info}] {latency_ms}ms")
                 valid_results.append(final_str)
 
-    # --- 结果保存 ---
-    # 1. 保存为 TXT
+    # 保存验证结果
     with open("valid_proxies.txt", "w", encoding="utf-8") as f:
         f.write("\n".join(valid_results))
 
