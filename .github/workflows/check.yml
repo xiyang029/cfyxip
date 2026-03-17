@@ -5,11 +5,6 @@ on:
     - cron: '0 */1 * * *'
   workflow_dispatch:
 
-# 放在最顶层，确保覆盖所有步骤
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
-
 jobs:
   verify:
     runs-on: ubuntu-latest
