@@ -2,12 +2,13 @@ name: Proxy Auto Checker
 
 on:
   schedule:
-    - cron: '0 */1 * * *' # 每1小时运行一次
-  workflow_dispatch:      # 允许手动运行
+    - cron: '0 */1 * * *'
+  workflow_dispatch:
 
-# 核心修改：强制所有 Action 使用 Node.js 24 运行以消除弃用警告
+# 放在最顶层，确保覆盖所有步骤
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
 jobs:
   verify:
@@ -27,8 +28,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: |
-          pip install requests PySocks
+        run: pip install requests PySocks
 
       - name: Run Verification
         run: python verify_proxies.py
@@ -38,12 +38,13 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           
-          # 检查文件是否存在并添加
-          git add valid_proxies.txt valid_proxies.json || echo "No files to add"
+          # 仅添加脚本实际生成的两个文件
+          git add valid_proxies.txt cfyxip.txt
           
+          # 检查是否有内容变化
           if git diff --staged --quiet; then
-            echo "没有发现代理变化，跳过更新。"
+            echo "代理列表内容未发生实质变化，跳过本次推送。"
           else
-            git commit -m "自动更新可用代理列表: $(date '+%Y-%m-%d %H:%M:%S')"
+            git commit -m "自动更新代理列表: $(date '+%Y-%m-%d %H:%M:%S')"
             git push origin HEAD
           fi
