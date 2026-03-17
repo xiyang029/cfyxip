@@ -5,21 +5,21 @@ on:
     - cron: '0 */1 * * *' # 每1小时运行一次
   workflow_dispatch:      # 允许手动运行
 
-# 强制使用最新的 Node.js 运行环境以消除警告
+# 核心修改：强制所有 Action 使用 Node.js 24 运行以消除弃用警告
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     permissions:
-      contents: write     # 必须开启写入权限
+      contents: write
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
-          persist-credentials: true # 关键：确保 Git 凭据持久化用于 Push
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,9 +39,8 @@ jobs:
           git config --local user.name "github-actions[bot]"
           
           # 检查文件是否存在并添加
-          git add valid_proxies.txt valid_proxies.json || echo "文件不存在，跳过"
+          git add valid_proxies.txt valid_proxies.json || echo "No files to add"
           
-          # 检查暂存区是否有变化
           if git diff --staged --quiet; then
             echo "没有发现代理变化，跳过更新。"
           else
