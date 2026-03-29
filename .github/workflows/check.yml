@@ -2,44 +2,50 @@ name: Proxy Auto Checker
 
 on:
   schedule:
-    - cron: '0 */1 * * *'
+    - cron: '0 * * * *'
   workflow_dispatch:
+
+concurrency:
+  group: proxy-auto-checker
+  cancel-in-progress: true
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
 
     steps:
-      - name: Checkout Code
+      - name: 拉取仓库
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Set up Python
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Dependencies
-        run: pip install requests PySocks
+      - name: 安装依赖
+        run: python -m pip install --upgrade pip requests PySocks
 
-      - name: Run Verification
+      - name: 语法检查
+        run: python -m py_compile verify_proxies.py
+
+      - name: 执行检测
         run: python verify_proxies.py
 
-      - name: Commit and Push Results
+      - name: 提交结果
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          
-          # 仅添加脚本实际生成的两个文件
-          git add valid_proxies.txt cfyxip.txt
-          
-          # 检查是否有内容变化
-          if git diff --staged --quiet; then
-            echo "代理列表内容未发生实质变化，跳过本次推送。"
+
+          git add cfyxip.txt valid_proxies.txt
+
+          if git diff --cached --quiet; then
+            echo "没有检测到结果变化，跳过提交。"
           else
-            git commit -m "自动更新代理列表: $(date '+%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD
+            git commit -m "自动更新代理结果: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push
           fi
