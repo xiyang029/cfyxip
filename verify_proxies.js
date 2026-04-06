@@ -143,42 +143,60 @@ function parseSocks5Proxy(proxyStr) {
 function socks5Probe(host, port, user, password, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
+    let dataBuffer = Buffer.alloc(0);
     const socket = net.createConnection({ host, port, timeout: timeout * 1000 });
     socket.on("error", () => resolve([false, 0]));
     socket.on("timeout", () => {
       socket.destroy();
       resolve([false, 0]);
     });
+    socket.on("data", (chunk) => {
+      dataBuffer = Buffer.concat([dataBuffer, chunk]);
+    });
     socket.on("connect", () => {
       const methods = user || password ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]);
       socket.write(methods);
-      const waitReply = () => {
-        socket.once("data", (reply) => {
-          if (!reply || reply[0] !== 5 || reply[1] === 0xff) {
-            socket.end();
-            return resolve([false, 0]);
-          }
-          if (reply[1] === 2) {
-            const userBuf = Buffer.from(user, "utf-8");
-            const passBuf = Buffer.from(password, "utf-8");
-            const authPack = Buffer.concat([Buffer.from([1, userBuf.length]), userBuf, Buffer.from([passBuf.length]), passBuf]);
-            socket.write(authPack);
-            socket.once("data", (authReply) => {
-              if (!authReply || authReply[1] !== 0) {
-                socket.end();
-                return resolve([false, 0]);
-              }
-              sendConnect();
-            });
-          } else {
-            sendConnect();
-          }
-        });
-      };
-      waitReply();
     });
 
-    function sendConnect() {
+    function readBytes(n) {
+      return new Promise((resolve) => {
+        const check = () => {
+          if (dataBuffer.length >= n) {
+            const result = dataBuffer.slice(0, n);
+            dataBuffer = dataBuffer.slice(n);
+            resolve(result);
+          } else {
+            socket.once("data", check);
+          }
+        };
+        check();
+      });
+    }
+
+    async function handleResponse() {
+      const reply = await readBytes(2);
+      if (!reply || reply[0] !== 5 || reply[1] === 0xff) {
+        socket.end();
+        return resolve([false, 0]);
+      }
+      if (reply[1] === 2) {
+        const userBuf = Buffer.from(user, "utf-8");
+        const passBuf = Buffer.from(password, "utf-8");
+        const authPack = Buffer.concat([Buffer.from([1, userBuf.length]), userBuf, Buffer.from([passBuf.length]), passBuf]);
+        socket.write(authPack);
+        const authReply = await readBytes(2);
+        if (!authReply || authReply[1] !== 0) {
+          socket.end();
+          return resolve([false, 0]);
+        }
+      } else if (reply[1] !== 0) {
+        socket.end();
+        return resolve([false, 0]);
+      }
+      sendConnect();
+    }
+
+    async function sendConnect() {
       const targetHost = SOCKS5_HANDSHAKE_TARGET.host;
       const targetPort = SOCKS5_HANDSHAKE_TARGET.port;
       const hostBuf = Buffer.from(targetHost, "utf-8");
@@ -186,42 +204,28 @@ function socks5Probe(host, port, user, password, timeout) {
       const portBuf = Buffer.alloc(2);
       portBuf.writeUInt16BE(targetPort, 0);
       socket.write(Buffer.concat([connectPack, portBuf]));
-      socket.once("data", (header) => {
-        if (!header || header[0] !== 5 || header[1] !== 0) {
-          socket.end();
-          return resolve([false, 0]);
-        }
-        const atyp = header[3];
-        let skipBytes = atyp === 1 ? 4 : atyp === 3 ? 1 : atyp === 4 ? 16 : 0;
-        if (skipBytes > 0) {
-          socket.once("data", (extra) => {
-            skipBytes -= extra.length;
-            if (skipBytes > 0) {
-              socket.once("data", (rest) => {
-                skipBytes -= rest.length;
-                finishConnect();
-              });
-            } else {
-              finishConnect();
-            }
-          });
-        } else {
-          finishConnect();
-        }
-      });
+      const header = await readBytes(4);
+      if (!header || header[0] !== 5 || header[1] !== 0) {
+        socket.end();
+        return resolve([false, 0]);
+      }
+      const atyp = header[3];
+      if (atyp === 1) await readBytes(4);
+      else if (atyp === 3) {
+        const domainLen = await readBytes(1);
+        await readBytes(domainLen[0]);
+      } else if (atyp === 4) await readBytes(16);
+      else {
+        socket.end();
+        return resolve([false, 0]);
+      }
+      await readBytes(2);
+      const latency = Date.now() - startTime;
+      socket.end();
+      resolve([true, latency]);
     }
 
-    function finishConnect() {
-      socket.read(2, (err, last) => {
-        if (err || !last) {
-          socket.end();
-          return resolve([false, 0]);
-        }
-        const latency = Date.now() - startTime;
-        socket.end();
-        resolve([true, latency]);
-      });
-    }
+    socket.once("data", handleResponse);
   });
 }
 
