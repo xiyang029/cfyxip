@@ -38,8 +38,7 @@ jobs:
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          git add cfyxip.txt
-          git add valid_proxies.txt || true
+          git add cfyxip.txt valid_proxies.txt 2>/dev/null || git add cfyxip.txt
 
           if git diff --cached --quiet; then
             echo "没有检测到结果变化，跳过提交。"

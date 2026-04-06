@@ -1,6 +1,6 @@
 # cfyxip
 
-用于自动筛选可用 SOCKS5 代理，并同步更新 Cloudflare 优选 IP。
+自动筛选可用 SOCKS5 代理，并同步更新 Cloudflare 优选 IP。
 
 ## 输出文件
 
@@ -16,16 +16,29 @@
 
 ## 本地运行
 
-```powershell
-python -m pip install requests PySocks
-python verify_proxies.py
+```bash
+node verify_proxies.js
 ```
+
+Node.js 原生模块，无需安装额外依赖。
+
+## IP 来源
+
+### Cloudflare 优选 IP
+- https://cf.090227.xyz/ct?ips=6 (电信)
+- https://cf.090227.xyz/cu (联通)
+- https://cf.090227.xyz/cmcc?ips=8 (移动)
+- https://cf.090227.xyz/CloudFlareYes (多线)
+- https://cf.090227.xyz/ip.164746.xyz
+
+### SOCKS5 代理源
+- https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.json
 
 ## GitHub Actions
 
 - `.github/workflows/check.yml` 每小时自动运行一次
 - 支持手动触发
-- 仅在 `cfyxip.txt` 或 `valid_proxies.txt` 发生变化时提交
+- 仅在结果发生变化时提交
 
 ## 结果示例
 
