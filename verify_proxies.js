@@ -8,12 +8,11 @@ const fs = require("fs");
 const IPINFO_TOKEN = "bb8e53e4d8d6a1";
 const TARGET_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.json";
 const CLOUDFLARE_IP_APIS = [
-  "https://cf.090227.xyz/ct?ips=6",
-  "https://cf.090227.xyz/cu",
-  "https://cf.090227.xyz/cmcc?ips=8",
-  "https://cf.090227.xyz/CloudFlareYes",
   "https://cf.090227.xyz/ip.164746.xyz"
 ];
+const EXTERNAL_SUB_URL = "https://sub.cmliussss.net";
+const EXTERNAL_SUB_TIMEOUT = 10;
+const EXTERNAL_SUB_MAX_COUNT = 100;
 const OUTPUT_FILE = "cfyxip.txt";
 const VALID_PROXY_FILE = "valid_proxies.txt";
 const MAX_WORKERS = 40;
@@ -29,10 +28,11 @@ const REQUEST_HEADERS = { "User-Agent": "cfyxip/2.0" };
 
 const geoCache = new Map();
 
-function httpGet(url, timeout = 15) {
+function httpGet(url, timeout = 15, customHeaders = null) {
   return new Promise((resolve) => {
     const protocol = url.startsWith("https") ? https : http;
-    const req = protocol.get(url, { headers: REQUEST_HEADERS }, (res) => {
+    const headers = customHeaders || REQUEST_HEADERS;
+    const req = protocol.get(url, { headers }, (res) => {
       if (res.statusCode !== 200) {
         resolve(null);
         return;
@@ -274,6 +274,57 @@ async function fetchCloudflareIPs() {
   });
 }
 
+async function fetchExternalIPs() {
+  const results = new Set();
+  try {
+    const url = `${EXTERNAL_SUB_URL.replace(/\/+$/, '')}/sub?host=example.com&uuid=00000000-0000-4000-8000-000000000000`;
+    const headers = {
+      "User-Agent": "edgetunnel (https://github.com/cmliu/edgetunnel)",
+      "Accept": "*/*"
+    };
+    const response = await httpGet(url, EXTERNAL_SUB_TIMEOUT, headers);
+    if (!response) return [];
+
+    let content;
+    try {
+      content = Buffer.from(response, 'base64').toString('utf-8');
+    } catch {
+      return [];
+    }
+
+    const lines = content.split('\n').map(line => line.trim()).filter(line => line);
+    let count = 0;
+
+    for (const line of lines) {
+      if (!line.startsWith('trojan://')) continue;
+      if (count >= EXTERNAL_SUB_MAX_COUNT) break;
+
+      // 解析trojan链接
+      const match = line.match(/trojan:\/\/[^@]+@([^:]+):(\d+)[^#]+#(.+)/);
+      if (match) {
+        const ip = match[1];
+        const port = parseInt(match[2]);
+        const country = match[3];
+
+        // 过滤广告节点
+        if (ip.includes('Join.my.Telegram') || country.includes('t.me')) continue;
+        if (!ip || isNaN(port) || port < 1 || port > 65535) continue;
+
+        results.add(`${ip}:${port}#${country}`);
+        count++;
+      }
+    }
+  } catch (e) {
+    console.log(`⚠️ 外部订阅器获取失败: ${e.message}`);
+  }
+
+  return Array.from(results).sort((a, b) => {
+    const la = a.split("#")[1] || "";
+    const lb = b.split("#")[1] || "";
+    return la.localeCompare(lb) || a.localeCompare(b);
+  });
+}
+
 async function loadProxyTasks() {
   const payload = await httpGet(TARGET_URL, 15);
   if (!Array.isArray(payload)) {
@@ -300,11 +351,25 @@ function writeLines(path, lines) {
 async function main() {
   console.log("🚀 开始获取 Cloudflare 优选 IP...");
   const cloudflareIPs = await fetchCloudflareIPs();
-  if (cloudflareIPs.length) {
-    writeLines(OUTPUT_FILE, cloudflareIPs);
-    console.log(`✅ Cloudflare 优选 IP 已更新: ${cloudflareIPs.length} 条`);
+  console.log(`✅ Cloudflare 优选 IP 获取: ${cloudflareIPs.length} 条`);
+
+  console.log("\n🚀 开始获取外部订阅器优选 IP...");
+  const externalIPs = await fetchExternalIPs();
+  console.log(`✅ 外部订阅器优选 IP 获取: ${externalIPs.length} 条`);
+
+  // 合并去重
+  const allIPs = new Set([...cloudflareIPs, ...externalIPs]);
+  const sortedIPs = Array.from(allIPs).sort((a, b) => {
+    const la = a.split("#")[1] || "";
+    const lb = b.split("#")[1] || "";
+    return la.localeCompare(lb) || a.localeCompare(b);
+  });
+
+  if (sortedIPs.length) {
+    writeLines(OUTPUT_FILE, sortedIPs);
+    console.log(`✅ 优选 IP 总数量: ${sortedIPs.length} 条，已写入 ${OUTPUT_FILE}`);
   } else {
-    console.log("⚠️ Cloudflare 优选 IP 未更新，保留现有结果");
+    console.log("⚠️ 未获取到任何优选 IP，保留现有结果");
   }
 
   console.log("\n🚀 开始获取 SOCKS5 代理源...");
