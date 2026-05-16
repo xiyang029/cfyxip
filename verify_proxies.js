@@ -8,7 +8,10 @@ const fs = require("fs");
 const IPINFO_TOKEN = "bb8e53e4d8d6a1";
 const TARGET_URL = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.json";
 const CLOUDFLARE_IP_APIS = [
-  "https://cf.090227.xyz/ip.164746.xyz"
+  "https://cf.090227.xyz/ip.164746.xyz",
+  "https://cf.090227.xyz/ct?ips=3",
+  "https://cf.090227.xyz/cu?ips=3",
+  "https://cf.090227.xyz/cmcc?ips=3",
 ];
 const EXTERNAL_SUB_URL = "https://sub.cmliussss.net";
 const EXTERNAL_SUB_TIMEOUT = 10;
