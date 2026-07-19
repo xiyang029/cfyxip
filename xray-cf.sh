@@ -561,13 +561,19 @@ print_link() {
 # ── 交互辅助 ─────────────────────────────────────────
 prompt_uuid() {
     local uid
-    read -rp "UUID(留空=自动生成): " custom_uuid
-    if [[ -n "$custom_uuid" ]]; then
-        [[ "$custom_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-        uid="${custom_uuid,,}"
-    else
-        uid=$(gen_uuid)
-    fi
+    while true; do
+        read -rp "UUID(留空=自动生成): " custom_uuid
+        if [[ -n "$custom_uuid" ]]; then
+            if [[ "$custom_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                uid="${custom_uuid,,}"
+                break
+            fi
+            echo "UUID 格式不正确，请重新输入（格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
+        else
+            uid=$(gen_uuid)
+            break
+        fi
+    done
     echo "$uid"
 }
 
@@ -580,13 +586,15 @@ prompt_path_prefix() {
 }
 
 prompt_transport() {
-    read -rp "传输协议(1=WebSocket, 2=HTTPUpgrade, 3=SplitHTTP/XHTTP，留空=WebSocket): " tr_raw
-    case "${tr_raw:-1}" in
-        1|ws|websocket)           echo "ws" ;;
-        2|httpupgrade|upgrade)    echo "httpupgrade" ;;
-        3|splithttp|xhttp)        echo "splithttp" ;;
-        *)                        die "无效传输协议: $tr_raw" ;;
-    esac
+    while true; do
+        read -rp "传输协议(1=WebSocket, 2=HTTPUpgrade, 3=SplitHTTP/XHTTP，留空=WebSocket): " tr_raw
+        case "${tr_raw:-1}" in
+            1|ws|websocket)           echo "ws"; break ;;
+            2|httpupgrade|upgrade)    echo "httpupgrade"; break ;;
+            3|splithttp|xhttp)        echo "splithttp"; break ;;
+            *)                        echo "无效传输协议: $tr_raw，请重新选择" ;;
+        esac
+    done
 }
 
 prompt_tls() {
@@ -604,13 +612,19 @@ build_route() {
     local net_mode="$1" path_prefix="$2" transport="$3" tls_enabled="$4"
 
     local port
-    read -rp "端口: " port
-    [[ "$port" =~ ^[0-9]+$ ]] || die "无效端口: $port"
+    while true; do
+        read -rp "端口: " port
+        [[ "$port" =~ ^[0-9]+$ ]] && break
+        echo "无效端口: $port，请输入数字"
+    done
 
     if [[ "$net_mode" == "nat" ]]; then
         local ext_port
-        read -rp "外部映射端口(对外暴露): " ext_port
-        [[ "$ext_port" =~ ^[0-9]+$ ]] || die "无效端口: $ext_port"
+        while true; do
+            read -rp "外部映射端口(对外暴露): " ext_port
+            [[ "$ext_port" =~ ^[0-9]+$ ]] && break
+            echo "无效端口: $ext_port，请输入数字"
+        done
         jq -n --arg p "vless" --argjson lp "$((port))" --argjson cp "$((ext_port))" --arg pa "$path_prefix" --arg tr "$transport" --argjson tls "$tls_enabled" \
             '{protocol:$p, listen_port:$lp, cf_port:$cp, path:$pa, transport:$tr, tls:$tls}'
     else
@@ -827,17 +841,23 @@ do_modify() {
 
     local new_uid="$uid" new_route="$route_json" changed=false
 
-    [[ "$mc" =~ ^[0-6]$ ]] || die "无效选项"
+    [[ "$mc" =~ ^[0-6]$ ]] || { echo "无效选项"; return; }
     [[ "$mc" == "0" ]] && return
 
     if [[ "$mc" == "1" || "$mc" == "6" ]]; then
-        read -rp "新 UUID(留空=重新生成): " iu
-        if [[ -n "$iu" ]]; then
-            [[ "$iu" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式不正确"
-            new_uid="${iu,,}"
-        else
-            new_uid=$(gen_uuid)
-        fi
+        while true; do
+            read -rp "新 UUID(留空=重新生成): " iu
+            if [[ -n "$iu" ]]; then
+                if [[ "$iu" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                    new_uid="${iu,,}"
+                    break
+                fi
+                echo "UUID 格式不正确，请重新输入（格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）"
+            else
+                new_uid=$(gen_uuid)
+                break
+            fi
+        done
         changed=true; ok "UUID: $new_uid"
     fi
 
@@ -848,15 +868,19 @@ do_modify() {
             cp=$(echo "$new_route" | jq -r '.cf_port')
             read -rp "内部监听端口(当前=$lp): " new_lp
             read -rp "外部映射端口(当前=$cp): " new_cp
-            [[ -n "$new_lp" ]] && { [[ "$new_lp" =~ ^[0-9]+$ ]] || die "无效端口"; lp="$new_lp"; }
-            [[ -n "$new_cp" ]] && { [[ "$new_cp" =~ ^[0-9]+$ ]] || die "无效端口"; cp="$new_cp"; }
+            if [[ -n "$new_lp" ]]; then
+                [[ "$new_lp" =~ ^[0-9]+$ ]] && lp="$new_lp" || { echo "无效端口: $new_lp"; return; }
+            fi
+            if [[ -n "$new_cp" ]]; then
+                [[ "$new_cp" =~ ^[0-9]+$ ]] && cp="$new_cp" || { echo "无效端口: $new_cp"; return; }
+            fi
             new_route=$(echo "$new_route" | jq --argjson lp "$((lp))" --argjson cp "$((cp))" '.listen_port=$lp|.cf_port=$cp')
             changed=true; ok "端口已更新"
         else
             local p; p=$(echo "$new_route" | jq -r '.listen_port')
             read -rp "新端口(当前=$p): " np
             if [[ -n "$np" ]]; then
-                [[ "$np" =~ ^[0-9]+$ ]] || die "无效端口: $np"
+                [[ "$np" =~ ^[0-9]+$ ]] || { echo "无效端口: $np"; return; }
                 new_route=$(echo "$new_route" | jq --argjson p "$((np))" '.listen_port=$p|.cf_port=$p')
                 changed=true; ok "端口已更新"
             fi
@@ -1103,15 +1127,17 @@ main() {
     echo "  7. 更新 xray"
     echo "  8. 重启 xray"
     [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
+    echo "  0. 退出"
     echo
 
-    read -rp "请选择 [1-8]: " choice
+    read -rp "请选择 [0-8]: " choice
     case "$choice" in
+        0) exit 0 ;;
         1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
         4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
         7) do_update_xray ;;
         8) do_restart ;;
-        *) die "无效选项: $choice" ;;
+        *) echo "无效选项: $choice，请重新选择"; sleep 1; main ;;
     esac
 }
 
