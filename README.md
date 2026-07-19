@@ -25,7 +25,7 @@ Node.js 原生模块，无需安装额外依赖。
 ## Linux 获取 xray-cf.sh 脚本
 
 ```bash
-curl -sSfL -o xray-cf.sh https://raw.githubusercontent.com/lipengfei/cfyxip/main/xray-cf.sh
+curl -sSfL -o xray-cf.sh https://raw.githubusercontent.com/xiyang029/cfyxip/refs/heads/main/xray-cf.sh
 chmod +x xray-cf.sh
 ```
 
