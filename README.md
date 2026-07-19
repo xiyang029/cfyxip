@@ -22,6 +22,25 @@ node verify_proxies.js
 
 Node.js 原生模块，无需安装额外依赖。
 
+## Linux 获取 xray-cf.sh 脚本
+
+```bash
+curl -sSfL -o xray-cf.sh https://raw.githubusercontent.com/lipengfei/cfyxip/main/xray-cf.sh
+chmod +x xray-cf.sh
+```
+
+该脚本为 Xray + Cloudflare 一键部署工具，支持安装、卸载、配置修改、订阅查看等功能。运行方式：
+
+```bash
+# 交互式运行
+sudo bash xray-cf.sh
+
+# 或直接指定操作
+sudo bash xray-cf.sh install   # 安装
+sudo bash xray-cf.sh uninstall # 卸载
+sudo bash xray-cf.sh show      # 查看订阅
+```
+
 ## IP 来源
 
 ### Cloudflare 优选 IP
