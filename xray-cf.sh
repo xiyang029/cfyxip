@@ -460,7 +460,7 @@ gen_xray_config() {
     local route_json="$1" uid="$2"
     local port; port=$(echo "$route_json" | jq -r '.listen_port')
     local path; path=$(echo "$route_json" | jq -r '.path')
-    local transport; transport=$(echo "$route_json" | jq -r '.transport // "ws"')
+    local transport; transport=$(echo "$route_json" | jq -r '.transport // "httpupgrade"')
     local domain; domain=$(echo "$route_json" | jq -r '.domain // ""')
     local tls_enabled; tls_enabled=$(echo "$route_json" | jq -r '.tls // false')
 
@@ -483,11 +483,7 @@ gen_xray_config() {
                 }')
                 ;;
             *)
-                stream_settings=$(jq -n --arg p "$path" --arg d "$domain" '{
-                    network:"ws", security:"tls",
-                    tlsSettings:{serverName:$d, certificates:[{certificateFile:"/usr/local/etc/xray/origin.crt",keyFile:"/usr/local/etc/xray/origin.key"}]},
-                    wsSettings:{path:$p}
-                }')
+                echo "不支持的传输协议: $transport" >&2; return 1
                 ;;
         esac
     else
@@ -506,10 +502,7 @@ gen_xray_config() {
                 }')
                 ;;
             *)
-                stream_settings=$(jq -n --arg p "$path" '{
-                    network:"ws", security:"none",
-                    wsSettings:{path:$p}
-                }')
+                echo "不支持的传输协议: $transport" >&2; return 1
                 ;;
         esac
     fi
@@ -587,11 +580,10 @@ prompt_path_prefix() {
 
 prompt_transport() {
     while true; do
-        read -rp "传输协议(1=WebSocket, 2=HTTPUpgrade, 3=SplitHTTP/XHTTP，留空=WebSocket): " tr_raw
+        read -rp "传输协议(1=HTTPUpgrade, 2=XHTTP，留空=HTTPUpgrade): " tr_raw
         case "${tr_raw:-1}" in
-            1|ws|websocket)           echo "ws"; break ;;
-            2|httpupgrade|upgrade)    echo "httpupgrade"; break ;;
-            3|splithttp|xhttp)        echo "splithttp"; break ;;
+            1|httpupgrade|upgrade)    echo "httpupgrade"; break ;;
+            2|splithttp|xhttp)        echo "splithttp"; break ;;
             *)                        echo "无效传输协议: $tr_raw，请重新选择" ;;
         esac
     done
@@ -637,7 +629,7 @@ build_route() {
 do_install() {
     local state
     state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] && die "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"
+    [[ -n "$state" ]] && { echo "检测到上次配置($(echo "$state" | jq -r '.domain // "?"'))，请先卸载"; return; }
 
     [[ -f "$XRAY_BINARY" ]] && ok "xray-core 已安装" || install_xray
 
@@ -689,7 +681,7 @@ do_install() {
     echo "  路径: $(echo "$route_json" | jq -r '.path')"
     echo
     read -rp "确认部署? (Y/n): " confirm
-    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
+    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
 
     # xray
     local config
@@ -720,7 +712,7 @@ do_install() {
     apply_origin_rule "$zone_id" "$domain" "$route_json"
     ok "Origin Rule 已创建"
 
-    # 安全规则：关闭可能拦截 WS 的设置
+    # 安全规则：关闭可能拦截传输的 CF 安全设置
     local security_backup
     security_backup=$(cf_relax_security "$zone_id")
 
@@ -753,7 +745,7 @@ do_install() {
 do_uninstall() {
     local state
     state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到上次配置"
+    [[ -n "$state" ]] || { echo "未检测到上次配置"; return; }
 
     local domain; domain=$(echo "$state" | jq -r '.domain')
     local tls_was_enabled; tls_was_enabled=$(echo "$state" | jq -r '.route.tls // false')
@@ -805,7 +797,7 @@ do_uninstall() {
 do_show() {
     if [[ -f "$LAST_LINKS_PATH" ]]; then cat "$LAST_LINKS_PATH"; return; fi
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "无历史订阅"
+    [[ -n "$state" ]] || { echo "无历史订阅"; return; }
     echo "域名: $(echo "$state" | jq -r '.domain')"
     echo "UUID: $(echo "$state" | jq -r '.uuid')"
     echo "VLESS订阅 $(echo "$state" | jq -r '.link')"
@@ -814,7 +806,7 @@ do_show() {
 # ── 4. 修改配置 ──────────────────────────────────────
 do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    [[ -n "$state" ]] || { echo "未检测到部署"; return; }
 
     local domain uid route_json net_mode
     domain=$(echo "$state" | jq -r '.domain')
@@ -825,7 +817,7 @@ do_modify() {
     echo
     echo "当前配置 ($net_mode):"
     echo "  域名: $domain  UUID: $uid"
-    echo "  传输协议: $(echo "$route_json" | jq -r '.transport // "ws"')"
+    echo "  传输协议: $(echo "$route_json" | jq -r '.transport // "httpupgrade"')"
     echo "  CF→VPS加密: $(echo "$route_json" | jq -r '.tls // false')"
     echo "  端口: $(echo "$route_json" | jq -r '.listen_port')  CF端口: $(echo "$route_json" | jq -r '.cf_port') 路径: $(echo "$route_json" | jq -r '.path')"
     echo
@@ -898,7 +890,7 @@ do_modify() {
     fi
 
     if [[ "$mc" == "4" || "$mc" == "6" ]]; then
-        local cur_tr; cur_tr=$(echo "$new_route" | jq -r '.transport // "ws"')
+        local cur_tr; cur_tr=$(echo "$new_route" | jq -r '.transport // "httpupgrade"')
         echo "当前传输协议: $cur_tr"
         new_tr=$(prompt_transport)
         new_route=$(echo "$new_route" | jq --arg t "$new_tr" '.transport=$t')
@@ -955,7 +947,7 @@ do_modify() {
         ok "Origin Rule 已更新"
     fi
 
-    local link; link=$(build_link "$new_uid" "$domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "ws"')")
+    local link; link=$(build_link "$new_uid" "$domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "httpupgrade"')")
     save_links_snapshot "$domain" "$new_uid" "$link"
     save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_route" --arg l "$link" \
         '.uuid=$u|.route=$r|.link=$l')"
@@ -966,13 +958,13 @@ do_modify() {
 # ── 5. 查看当前配置 ──────────────────────────────────
 do_show_config() {
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    [[ -n "$state" ]] || { echo "未检测到部署"; return; }
 
     echo
     echo "域名:  $(echo "$state" | jq -r '.domain')"
     echo "UUID:  $(echo "$state" | jq -r '.uuid')"
     echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
-    echo "传输协议: $(echo "$state" | jq -r '.route.transport // "ws"')"
+    echo "传输协议: $(echo "$state" | jq -r '.route.transport // "httpupgrade"')"
     echo "CF→VPS加密: $(echo "$state" | jq -r '.route.tls // false')"
     echo "端口:  $(echo "$state" | jq -r '.route.listen_port')"
     echo "CF端口: $(echo "$state" | jq -r '.route.cf_port')"
@@ -988,7 +980,7 @@ do_show_config() {
 # ── 6. 更新外部端口（NAT 快捷操作）──────────────────
 do_update_ports() {
     local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || die "未检测到部署"
+    [[ -n "$state" ]] || { echo "未检测到部署"; return; }
 
     local domain route_json net_mode
     domain=$(echo "$state" | jq -r '.domain')
@@ -1006,14 +998,14 @@ do_update_ports() {
 
         local old_cp; old_cp=$(echo "$route_json" | jq -r '.cf_port')
         read -rp "新外部端口(当前=$old_cp): " ne
-        [[ -n "$ne" ]] || die "不能为空"
-        [[ "$ne" =~ ^[0-9]+$ ]] || die "无效端口: $ne"
+        [[ -n "$ne" ]] || { echo "不能为空"; return; }
+        [[ "$ne" =~ ^[0-9]+$ ]] || { echo "无效端口: $ne"; return; }
         local new_route; new_route=$(echo "$route_json" | jq --argjson p "$((ne))" '.cf_port=$p')
 
         echo
         echo "更新预览: 监听:$(echo "$new_route" | jq -r '.listen_port') -> 外部:$(echo "$new_route" | jq -r '.cf_port')"
         read -rp "确认? (Y/n): " confirm
-        [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
+        [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
 
         load_cf_account || die "未找到 CF 凭据"
         apply_origin_rule "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_route"
@@ -1030,7 +1022,7 @@ do_update_ports() {
         fi
 
         local uid; uid=$(echo "$state" | jq -r '.uuid')
-        local link; link=$(build_link "$uid" "$domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "ws"')")
+        local link; link=$(build_link "$uid" "$domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "httpupgrade"')")
         save_links_snapshot "$domain" "$uid" "$link"
         save_state "$(echo "$state" | jq --argjson r "$new_route" --arg l "$link" '.route=$r|.link=$l')"
 
@@ -1108,37 +1100,39 @@ main() {
     need_cmd curl; need_cmd jq; need_cmd openssl
     ensure_shortcut
 
-    local state current_domain="" net_mode=""
-    state=$(load_state 2>/dev/null || true)
-    if [[ -n "$state" ]]; then
-        current_domain=$(echo "$state" | jq -r '.domain // ""')
-        net_mode=$(echo "$state" | jq -r '.net_mode // ""')
-    fi
+    while true; do
+        local state current_domain="" net_mode=""
+        state=$(load_state 2>/dev/null || true)
+        if [[ -n "$state" ]]; then
+            current_domain=$(echo "$state" | jq -r '.domain // ""')
+            net_mode=$(echo "$state" | jq -r '.net_mode // ""')
+        fi
 
-    echo
-    echo "  xray-cf-lite ($INIT_SYSTEM)"
-    echo
-    echo "  1. 安装节点"
-    echo "  2. 卸载"
-    echo "  3. 查看订阅"
-    echo "  4. 修改配置(UUID/端口/路径)"
-    echo "  5. 查看当前配置"
-    echo "  6. 更新外部端口(NAT换端口)"
-    echo "  7. 更新 xray"
-    echo "  8. 重启 xray"
-    [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
-    echo "  0. 退出"
-    echo
+        echo
+        echo "  xray-cf-lite ($INIT_SYSTEM)"
+        echo
+        echo "  1. 安装节点"
+        echo "  2. 卸载"
+        echo "  3. 查看订阅"
+        echo "  4. 修改配置(UUID/端口/路径)"
+        echo "  5. 查看当前配置"
+        echo "  6. 更新外部端口(NAT换端口)"
+        echo "  7. 更新 xray"
+        echo "  8. 重启 xray"
+        [[ -n "$current_domain" ]] && echo "     (当前: $current_domain${net_mode:+ [$net_mode]})"
+        echo "  0. 退出"
+        echo
 
-    read -rp "请选择 [0-8]: " choice
-    case "$choice" in
-        0) exit 0 ;;
-        1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
-        4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-        7) do_update_xray ;;
-        8) do_restart ;;
-        *) echo "无效选项: $choice，请重新选择"; sleep 1; main ;;
-    esac
+        read -rp "请选择 [0-8]: " choice
+        case "$choice" in
+            0) exit 0 ;;
+            1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
+            4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
+            7) do_update_xray ;;
+            8) do_restart ;;
+            *) echo "无效选项: $choice，请重新选择"; sleep 1 ;;
+        esac
+    done
 }
 
 main "$@"
