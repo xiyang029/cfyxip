@@ -56,25 +56,10 @@ get_xray_version() {
 }
 
 get_latest_xray_version() {
-    local release prerelease release_version prerelease_version
-    release=$(curl -sf --connect-timeout 5 --max-time 15 \
-        -H 'User-Agent: xray-cf-lite' "${XRAY_RELEASES_API}/latest" |
-        jq -r '.tag_name // empty' 2>/dev/null || true)
-    prerelease=$(curl -sf --connect-timeout 5 --max-time 15 \
-        -H 'User-Agent: xray-cf-lite' "${XRAY_RELEASES_API}?per_page=1" |
-        jq -r '.[0].tag_name // empty' 2>/dev/null || true)
-    release_version="${release#v}"
-    prerelease_version="${prerelease#v}"
-
-    if [[ -z "$release_version" ]]; then
-        printf '%s\n' "$prerelease_version"
-    elif [[ -z "$prerelease_version" ]]; then
-        printf '%s\n' "$release_version"
-    elif [[ "$(printf '%s\n%s\n' "$release_version" "$prerelease_version" | sort -V | tail -1)" == "$prerelease_version" ]]; then
-        printf '%s\n' "$prerelease_version"
-    else
-        printf '%s\n' "$release_version"
-    fi
+    curl -sf --connect-timeout 5 --max-time 15 \
+        -H 'User-Agent: xray-cf-lite' "${XRAY_RELEASES_API}?per_page=100" |
+        jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null |
+        sed 's/^v//' || true
 }
 
 check_xray_update() {
@@ -98,14 +83,9 @@ check_xray_update() {
 }
 
 # ── init 系统检测 ─────────────────────────────────────
-INIT_SYSTEM=""
-detect_init() {
-    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
-        INIT_SYSTEM="systemd"
-    elif command -v rc-service &>/dev/null; then
-        INIT_SYSTEM="openrc"
-    else
-        die "不支持的 init 系统（需要 systemd 或 OpenRC）"
+require_systemd() {
+    if ! command -v systemctl &>/dev/null || ! systemctl --version &>/dev/null 2>&1; then
+        die "仅支持 systemd 系统"
     fi
 }
 
@@ -114,7 +94,6 @@ install_deps() {
     local missing=()
     command -v curl    &>/dev/null || missing+=(curl)
     command -v jq      &>/dev/null || missing+=(jq)
-    command -v unzip   &>/dev/null || missing+=(unzip)
     command -v openssl &>/dev/null || missing+=(openssl)
     [[ ${#missing[@]} -eq 0 ]] && return
 
@@ -131,37 +110,14 @@ install_deps() {
 }
 
 # ── xray 服务管理 ────────────────────────────────────
-XRAY_OPENRC_SCRIPT="/etc/init.d/xray"
-
-write_openrc_script() {
-    cat > "$XRAY_OPENRC_SCRIPT" << 'INITEOF'
-#!/sbin/openrc-run
-name="xray"
-description="Xray proxy server"
-command="/usr/local/bin/xray"
-command_args="run -config /usr/local/etc/xray/config.json"
-command_background=true
-pidfile="/run/xray.pid"
-output_log="/var/log/xray.log"
-error_log="/var/log/xray.log"
-respawn_delay=1
-respawn_max=0
-respawn_period=86400
-supervise_daemon_args="--respawn-delay ${respawn_delay} --respawn-max ${respawn_max} --respawn-period ${respawn_period}"
-supervisor=supervise-daemon
-depend() { need net; after firewall; }
-INITEOF
-    chmod +x "$XRAY_OPENRC_SCRIPT"
-}
-
-svc_enable()    { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl enable xray &>/dev/null; else rc-update add xray default &>/dev/null; fi; true; }
-svc_start()     { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else [[ -f "$XRAY_OPENRC_SCRIPT" ]] || write_openrc_script; rc-service xray restart; fi; }
-svc_stop()      { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl stop xray &>/dev/null; systemctl disable xray &>/dev/null; else rc-service xray stop &>/dev/null; rc-update del xray default &>/dev/null; fi; true; }
-svc_is_active() { if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl is-active xray &>/dev/null; else rc-service xray status &>/dev/null 2>&1; fi; }
+svc_enable()    { systemctl enable xray &>/dev/null; true; }
+svc_start()     { systemctl restart xray; }
+svc_stop()      { systemctl stop xray &>/dev/null; systemctl disable xray &>/dev/null; true; }
+svc_is_active() { systemctl is-active xray &>/dev/null; }
 
 ensure_systemd_restart() {
     local drop="/etc/systemd/system/xray.service.d"
-    if [[ "$INIT_SYSTEM" == "systemd" && ! -f "$drop/restart.conf" ]]; then
+    if [[ ! -f "$drop/restart.conf" ]]; then
         mkdir -p "$drop"
         cat > "$drop/restart.conf" << 'SDEOF'
 [Service]
@@ -174,7 +130,7 @@ SDEOF
 
 restart_xray() {
     fix_origin_cert_permissions
-    [[ "$INIT_SYSTEM" == "systemd" ]] && ensure_systemd_restart
+    ensure_systemd_restart
     svc_enable
     svc_start || die "xray 重启失败"
     sleep 1
@@ -448,10 +404,8 @@ fix_origin_cert_permissions() {
     [[ -f "$XRAY_CONFIG_DIR/origin.key" ]] || return 0
 
     local service_user service_group
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        service_user=$(systemctl show xray -p User --value 2>/dev/null || true)
-        service_group=$(systemctl show xray -p Group --value 2>/dev/null || true)
-    fi
+    service_user=$(systemctl show xray -p User --value 2>/dev/null || true)
+    service_group=$(systemctl show xray -p Group --value 2>/dev/null || true)
     service_user="${service_user:-root}"
     if [[ -z "$service_group" ]]; then
         service_group=$(id -gn "$service_user" 2>/dev/null || true)
@@ -523,63 +477,45 @@ revoke_origin_cert() {
 # ── xray 安装 ─────────────────────────────────────────
 install_xray() {
     echo "正在安装 xray-core ..."
-
-    local target_version="${1:-$XRAY_UPDATE_LATEST}"
-    [[ -n "$target_version" ]] || target_version=$(get_latest_xray_version)
-    [[ -n "$target_version" ]] || die "获取 xray 版本失败"
-    target_version="v${target_version#v}"
-
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        if curl -fsSL "$XRAY_INSTALL_URL" | bash -s -- install 2>/dev/null; then
-            if [[ -f "$XRAY_BINARY" ]]; then
-                local installed_version; installed_version=$(get_xray_version || true)
-                if [[ "${installed_version#v}" == "${target_version#v}" ]]; then
-                    ok "xray-core 安装完成: v${installed_version#v}"
-                    return
-                fi
-                info "官方安装器未安装目标版本，改用 v${target_version#v} 手动更新"
-            fi
-        fi
-    fi
-
-    info "使用手动安装方式"
-    local arch
-    case "$(uname -m)" in
-        x86_64|amd64) arch="64" ;;
-        aarch64|arm64) arch="arm64-v8a" ;;
-        armv7*)        arch="arm32-v7a" ;;
-        *)             die "不支持的架构: $(uname -m)" ;;
-    esac
-
-    local ver="$target_version"
-    info "xray $ver ($arch)"
-
-    local tmp="/tmp/xray-install-$$"
-    mkdir -p "$tmp"
-    curl -fsSL -o "$tmp/xray.zip" "https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch}.zip" || die "下载失败"
-
-    unzip -o "$tmp/xray.zip" xray -d /usr/local/bin/ || die "解压失败"
-    chmod +x "$XRAY_BINARY"
-    rm -rf "$tmp"
-
-    local geo_dir="/usr/local/share/xray"
-    mkdir -p "$geo_dir"
-    for f in geoip.dat geosite.dat; do
-        [[ -f "$geo_dir/$f" ]] || curl -fsSL -o "$geo_dir/$f" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$f" || true
-    done
-
-    [[ -f "$XRAY_BINARY" ]] || die "安装后未找到 xray"
-    ok "xray-core 安装完成: $($XRAY_BINARY version | head -1)"
+    info "使用 Xray 官方安装器安装最新预发布版 (--beta)"
+    curl -fsSL "$XRAY_INSTALL_URL" | bash -s -- install --beta || die "Xray 官方安装器执行失败"
+    [[ -x "$XRAY_BINARY" ]] || die "安装后未找到 xray"
+    ok "xray-core 预发布版安装完成: $($XRAY_BINARY version | head -1)"
 }
 
 # ── xray 配置生成 ─────────────────────────────────────
 gen_xray_config() {
     local route_json="$1" uid="$2"
+    local protocol; protocol=$(echo "$route_json" | jq -r '.protocol // "vless"')
     local port; port=$(echo "$route_json" | jq -r '.listen_port')
     local path; path=$(echo "$route_json" | jq -r '.path')
     local transport; transport=$(echo "$route_json" | jq -r '.transport // "websocket"')
     local domain; domain=$(echo "$route_json" | jq -r '.domain // ""')
     local tls_enabled; tls_enabled=$(echo "$route_json" | jq -r '.tls // false')
+
+    if [[ "$protocol" == "reality" ]]; then
+        local reality_target reality_server_name reality_private_key reality_short_id reality_path
+        reality_target=$(echo "$route_json" | jq -r '.reality_target')
+        reality_server_name=$(echo "$route_json" | jq -r '.reality_server_name')
+        reality_private_key=$(echo "$route_json" | jq -r '.reality_private_key')
+        reality_short_id=$(echo "$route_json" | jq -r '.reality_short_id')
+        reality_path=$(echo "$route_json" | jq -r '.path // "/reality"')
+        jq -n --arg uid "$uid" --arg port "$port" --arg target "$reality_target" \
+            --arg sni "$reality_server_name" --arg private_key "$reality_private_key" \
+            --arg short_id "$reality_short_id" --arg path "$reality_path" '{
+            log:{loglevel:"warning"},
+            inbounds:[{
+                tag:"in-vless-reality", listen:"0.0.0.0", port:($port|tonumber), protocol:"vless",
+                settings:{clients:[{id:$uid,flow:""}],decryption:"none"},
+                streamSettings:{network:"xhttp",xhttpSettings:{path:$path},security:"reality",
+                    realitySettings:{target:$target,serverNames:[$sni],privateKey:$private_key,shortIds:[$short_id]}},
+                sniffing:{enabled:true,destOverride:["http","tls","quic"]}
+            }],
+            outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
+            routing:{domainStrategy:"IPIfNonMatch",rules:[{type:"field",outboundTag:"block",protocol:["bittorrent"]}]}
+        }'
+        return
+    fi
 
     local security="none" tls_settings="null"
     if [[ "$tls_enabled" == "true" ]]; then
@@ -648,6 +584,27 @@ build_link() {
     echo "$vless"
 }
 
+build_reality_link() {
+    local uid="$1" address="$2" port="$3" server_name="$4" public_key="$5" short_id="$6" path="${7:-/reality}" spider_x="${8:-}"
+    [[ -n "$spider_x" ]] || spider_x="$(openssl rand -hex 12)"
+    [[ "$spider_x" == /* ]] || spider_x="/${spider_x}"
+    echo "vless://${uid}@${address}:${port}?encryption=none&security=reality&sni=$(urlencode "$server_name")&fp=chrome&pbk=${public_key}&sid=${short_id}&spx=$(urlencode "$spider_x")&type=xhttp&path=$(urlencode "$path")&mode=auto#Reality-${address}"
+}
+
+# 生成 CF 域名（不开代理）的 DNS A 记录
+cf_upsert_dns_unproxied() {
+    local zone_id="$1" domain="$2" ip="$3"
+    local payload existing
+    payload=$(jq -n --arg n "$domain" --arg c "$ip" '{type:"A",name:$n,content:$c,proxied:false,ttl:120}')
+    existing=$(cf_get_dns "$zone_id" "$domain")
+    if [[ -n "$existing" ]]; then
+        local rid; rid=$(echo "$existing" | jq -r '.id')
+        cf_call PUT "/zones/${zone_id}/dns_records/${rid}" "$payload" | jq -r '.result.id'
+    else
+        cf_call POST "/zones/${zone_id}/dns_records" "$payload" | jq -r '.result.id'
+    fi
+}
+
 # 生成订阅转换链接
 build_sub_link() {
     local vless="$1"
@@ -661,13 +618,23 @@ save_state() { mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"; echo "$1" > "$ST
 remove_state() { rm -f "$STATE_PATH"; }
 
 save_links_snapshot() {
-    local domain="$1" uid="$2" link="$3" sub_link="$4"
-    { echo "域名: $domain"; echo "UUID: $uid"; echo "VLESS $link"; echo "订阅 $sub_link"; } > "$LAST_LINKS_PATH"
+    local domain="$1" uid="$2" link="$3" sub_link="${4:-}"
+    {
+        echo "域名: $domain"
+        echo "UUID: $uid"
+        echo "VLESS $link"
+        # Reality 直连不走 CDN，不生成订阅转换链接
+        [[ -n "$sub_link" ]] && echo "订阅 $sub_link"
+    } > "$LAST_LINKS_PATH"
     chmod 600 "$LAST_LINKS_PATH"
 }
 
 print_link() {
     echo -e "  \033[1;36m订阅\033[0m  \033[1;37m$1\033[0m"
+}
+
+print_vless() {
+    echo -e "  \033[1;35mVLESS\033[0m \033[1;37m$1\033[0m"
 }
 
 # ── 交互辅助 ─────────────────────────────────────────
@@ -706,6 +673,56 @@ prompt_transport() {
             *)                        echo "无效传输协议: $tr_raw，请重新选择" ;;
         esac
     done
+}
+
+prompt_protocol() {
+    while true; do
+        read -rp "节点协议(1=CF VLESS, 2=Reality直连，留空=CF VLESS): " protocol_raw
+        case "${protocol_raw:-1}" in
+            1|vless|cf) echo "vless"; return ;;
+            2|reality)   echo "reality"; return ;;
+            *) echo "无效协议: $protocol_raw，请重新选择" ;;
+        esac
+    done
+}
+
+gen_reality_keys() {
+    local private_key public_key raw_output
+    raw_output=$("$XRAY_BINARY" x25519 2>&1) || {
+        warn "xray x25519 命令执行失败"
+        return 1
+    }
+    # 兼容新旧版本；不依赖 IGNORECASE（mawk 不支持），用 tolower() 做大小写无关匹配
+    private_key=$(echo "$raw_output" | awk '{
+        line = tolower($0)
+        if (line ~ /priv/ && line ~ /key/) {
+            for (i=1; i<=NF; i++) {
+                if (tolower($i) ~ /key/) {
+                    gsub(/:$/, "", $i)
+                    print $(i+1)
+                    exit
+                }
+            }
+        }
+    }')
+    public_key=$(echo "$raw_output" | awk '{
+        line = tolower($0)
+        if (line ~ /pub/ && line ~ /key/) {
+            for (i=1; i<=NF; i++) {
+                if (tolower($i) ~ /key/) {
+                    gsub(/:$/, "", $i)
+                    print $(i+1)
+                    exit
+                }
+            }
+        }
+    }')
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        warn "x25519 输出格式无法解析:"
+        echo "$raw_output" | head -5
+        return 1
+    fi
+    jq -n --arg private "$private_key" --arg public "$public_key" '{private:$private,public:$public}'
 }
 
 prompt_tls() {
@@ -761,6 +778,106 @@ build_route() {
     fi
 }
 
+do_install_reality() {
+    local address port target server_name short_id keys route_json config link state_json net_mode
+
+    address=$(get_public_ip)
+    net_mode=$(detect_nat)
+    if [[ "$net_mode" == "nat" ]]; then
+        warn "检测到 NAT/内网网卡（如 AWS EIP）：公网 IP 未绑定到本机网卡"
+        info "请确认云厂商安全组/防火墙已放行 Reality 监听端口入站"
+    fi
+    local uid; uid=$(prompt_uuid)
+
+    read -rp "Reality 监听端口 (回车=443): " port
+    port="${port:-443}"
+    while ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); do
+        read -rp "无效端口，请重新输入 Reality 监听端口: " port
+    done
+
+    echo -e "  \033[2;37m提示: 避免使用 Microsoft/Google 等被 GFW 重点监控的域名作为伪装目标\033[0m"
+    read -rp "Reality 伪装目标 (回车=www.cloudflare.com:443): " target
+    target="${target:-www.cloudflare.com:443}"
+    target="${target#http://}"; target="${target#https://}"; target="${target%%/*}"
+    [[ "$target" == *:* ]] || target="${target}:443"
+    server_name="${target%%:*}"
+    read -rp "Reality SNI (回车=${server_name}): " sni_input
+    server_name="${sni_input:-$server_name}"
+    [[ "$server_name" =~ ^[A-Za-z0-9.-]+$ ]] || die "SNI 格式不正确"
+
+    keys=$(gen_reality_keys) || die "Reality 密钥生成失败，请确认 xray 支持 x25519"
+    short_id=$(openssl rand -hex 8) || die "Short ID 生成失败"
+    local path_prefix; path_prefix=$(prompt_path_prefix "${uid:0:8}")
+    local spider_x; spider_x="$(openssl rand -hex 12)"
+
+    local pub_key; pub_key=$(echo "$keys" | jq -r '.public')
+    local priv_key; priv_key=$(echo "$keys" | jq -r '.private')
+
+    # ── 可选绑定 CF 域名（不开代理）──
+    local cf_domain="" cf_zone_id="" cf_dns_record_id=""
+    echo
+    read -rp "绑定 CF 域名隐藏 IP? (Y/n，默认 N): " bind_cf
+    if [[ "${bind_cf,,}" == "y" || "${bind_cf,,}" == "yes" ]]; then
+        if ! load_cf_account; then
+            echo "需要 CF 凭据以创建 DNS 记录"
+            prompt_cf
+        fi
+        local selected_zone
+        selected_zone=$(prompt_select_zone)
+        cf_domain="${selected_zone%%|*}"
+        cf_zone_id="${selected_zone##*|}"
+        cf_dns_record_id=$(cf_upsert_dns_unproxied "$cf_zone_id" "$cf_domain" "$address")
+        ok "DNS A 记录已创建: $cf_domain -> $address（不开代理）"
+    fi
+
+    local display_domain="${cf_domain:-$address}"
+    route_json=$(jq -n --arg p "reality" --argjson lp "$((port))" --arg t "$target" \
+        --arg s "$server_name" --arg pk "$priv_key" --arg pub "$pub_key" \
+        --arg sid "$short_id" --arg pa "$path_prefix" --arg d "$display_domain" \
+        --arg cf "$cf_domain" --arg zid "$cf_zone_id" \
+        '{protocol:$p,domain:$d,listen_port:$lp,cf_port:$lp,path:$pa,transport:"xhttp",tls:false,
+        reality_target:$t,reality_server_name:$s,reality_private_key:$pk,reality_public_key:$pub,reality_short_id:$sid,
+        cf_domain:$cf,cf_zone_id:$zid}')
+
+    echo
+    header "═══════════════════════════════════"
+    header "       Reality 直连配置预览"
+    header "═══════════════════════════════════"
+    echo
+    echo -e "  \033[1;36m节点地址:\033[0m $display_domain"
+    [[ -n "$cf_domain" ]] && echo -e "  \033[1;36m源站 IP:\033[0m  $address"
+    echo -e "  \033[1;36m网络模式:\033[0m  $net_mode"
+    echo -e "  \033[1;36mUUID:\033[0m      $uid"
+    echo -e "  \033[1;36m监听端口:\033[0m  $port"
+    echo -e "  \033[1;36m伪装目标:\033[0m  $target"
+    echo -e "  \033[1;36mSNI:\033[0m       $server_name"
+    echo -e "  \033[1;36mXHTTP 路径:\033[0m  $path_prefix"
+    echo
+    read -rp "确认部署 Reality 直连? (Y/n，默认 Y): " confirm
+    [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
+
+    config=$(gen_xray_config "$route_json" "$uid")
+    write_xray_config "$config"
+    restart_xray
+
+    link=$(build_reality_link "$uid" "$display_domain" "$port" "$server_name" \
+        "$pub_key" "$short_id" "$path_prefix" "$spider_x")
+    save_links_snapshot "$display_domain" "$uid" "$link"
+    state_json=$(jq -n --arg d "$display_domain" --arg u "$uid" --arg mode "$net_mode" \
+        --argjson route "$route_json" --arg link "$link" \
+        '{domain:$d,uuid:$u,net_mode:$mode,route:$route,link:$link}')
+    save_state "$state_json"
+
+    echo
+    header "═══════════════════════════════════"
+    ok "Reality 直连部署完成"
+    if [[ "$net_mode" == "nat" ]]; then
+        warn "NAT 环境请确认安全组已放行 TCP $port → 本机 $port"
+    fi
+    print_vless "$link"
+    echo -e "  \033[2;37m已保存到 $LAST_LINKS_PATH\033[0m"
+}
+
 # ── 1. 安装 ──────────────────────────────────────────
 do_install() {
     local state
@@ -776,6 +893,13 @@ do_install() {
     local net_mode
     net_mode=$(detect_nat)
     [[ "$net_mode" == "nat" ]] && info "检测到 NAT 环境（内网 IP）" || info "直连环境"
+
+    local protocol
+    protocol=$(prompt_protocol)
+    if [[ "$protocol" == "reality" ]]; then
+        do_install_reality
+        return
+    fi
 
     prompt_cf
 
@@ -823,7 +947,6 @@ do_install() {
     local config
     config=$(gen_xray_config "$route_json" "$uid")
     write_xray_config "$config"
-    [[ "$INIT_SYSTEM" == "openrc" && ! -f "$XRAY_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
     restart_xray
 
     # CF
@@ -983,13 +1106,9 @@ do_purge() {
     if svc_is_active 2>/dev/null; then svc_stop; fi
     rm -f "$XRAY_BINARY"
     rm -rf "/usr/local/share/xray"
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        rm -f "/etc/systemd/system/xray.service"
-        rm -rf "/etc/systemd/system/xray.service.d"
-        systemctl daemon-reload &>/dev/null
-    elif [[ -f "$XRAY_OPENRC_SCRIPT" ]]; then
-        rm -f "$XRAY_OPENRC_SCRIPT"
-    fi
+    rm -f "/etc/systemd/system/xray.service"
+    rm -rf "/etc/systemd/system/xray.service.d"
+    systemctl daemon-reload &>/dev/null
 
     rm -f "$CF_ACCOUNT_PATH" "/usr/local/bin/x"
     ok "CF 凭证已删除"
@@ -1000,32 +1119,22 @@ do_purge() {
 
 # ── 3. 查看订阅 ──────────────────────────────────────
 do_show() {
-    if [[ -f "$LAST_LINKS_PATH" ]]; then
-        echo
-        header "═══════════════════════"
-        header "      订阅信息"
-        header "═══════════════════════"
-        echo
-        while IFS= read -r line; do
-            case "$line" in
-                域名:*) echo -e "  \033[1;36m${line%%:*}\033[0m:${line#*:}" ;;
-                UUID:*) echo -e "  \033[1;36m${line%%:*}\033[0m:${line#*:}" ;;
-                VLESS*) echo -e "  \033[1;35m${line%% *}\033[0m ${line#* }" ;;
-                订阅*)  echo -e "  \033[1;36m${line%% *}\033[0m  ${line#* }" ;;
-                *)       echo "  $line" ;;
-            esac
-        done < "$LAST_LINKS_PATH"
-        echo
-        return
-    fi
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || { echo "未检测到部署"; return; }
+
+    local protocol; protocol=$(echo "$state" | jq -r '.route.protocol // "vless"')
     echo
     header "═══════════════════════"
     header "      订阅信息"
     header "═══════════════════════"
     echo
-    echo -e "  \033[1;36m域名:\033[0m $(echo "$state" | jq -r '.domain')"
+    if [[ "$protocol" == "reality" ]]; then
+        local cf_domain; cf_domain=$(echo "$state" | jq -r '.route.cf_domain // ""')
+        echo -e "  \033[1;36m节点地址:\033[0m $(echo "$state" | jq -r '.domain')"
+        [[ -n "$cf_domain" ]] && echo -e "  \033[1;36m绑定域名:\033[0m $cf_domain"
+    else
+        echo -e "  \033[1;36m域名:\033[0m $(echo "$state" | jq -r '.domain')"
+    fi
     echo -e "  \033[1;36mUUID:\033[0m $(echo "$state" | jq -r '.uuid')"
     echo -e "  \033[1;35mVLESS\033[0m $(echo "$state" | jq -r '.link')"
     echo
@@ -1036,38 +1145,58 @@ do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || { echo "未检测到部署"; return; }
 
-    local domain uid route_json net_mode
+    local domain uid route_json net_mode protocol
     domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     route_json=$(echo "$state" | jq '.route')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
+    protocol=$(echo "$route_json" | jq -r '.protocol // "vless"')
 
     echo
     header "═══════════════════════════════════"
     header "    修改配置 ($net_mode)"
     header "═══════════════════════════════════"
     echo
-    echo -e "  \033[1;36m域名:\033[0m    $domain  \033[1;36mUUID:\033[0m $uid"
-    echo -e "  \033[1;36m传输协议:\033[0m $(echo "$route_json" | jq -r '.transport // "websocket"')"
-    echo -e "  \033[1;36mCF→VPS加密:\033[0m $(echo "$route_json" | jq -r '.tls // false')"
-    echo -e "  \033[1;36m端口:\033[0m    $(echo "$route_json" | jq -r '.listen_port')  \033[1;36mCF端口:\033[0m $(echo "$route_json" | jq -r '.cf_port')  \033[1;36m路径:\033[0m $(echo "$route_json" | jq -r '.path')"
+    echo -e "  \033[1;36m节点地址:\033[0m $domain  \033[1;36mUUID:\033[0m $uid"
+    if [[ "$protocol" == "reality" ]]; then
+        local cf_domain; cf_domain=$(echo "$route_json" | jq -r '.cf_domain // ""')
+        echo -e "  \033[1;36m协议:\033[0m    Reality  \033[1;36mSNI:\033[0m $(echo "$route_json" | jq -r '.reality_server_name')"
+        echo -e "  \033[1;36m伪装目标:\033[0m  $(echo "$route_json" | jq -r '.reality_target')"
+        [[ -n "$cf_domain" ]] && echo -e "  \033[1;36m绑定域名:\033[0m $cf_domain"
+    else
+        echo -e "  \033[1;36m传输协议:\033[0m $(echo "$route_json" | jq -r '.transport // "websocket"')"
+        echo -e "  \033[1;36mCF→VPS加密:\033[0m $(echo "$route_json" | jq -r '.tls // false')"
+    fi
+    echo -e "  \033[1;36m端口:\033[0m    $(echo "$route_json" | jq -r '.listen_port')"
+    echo -e "  \033[1;36m路径:\033[0m  $(echo "$route_json" | jq -r '.path // "/reality"')"
     echo
     header "───────────────────────────────────"
     echo -e "  \033[1;32m 1\033[0m. 修改 UUID"
-    echo -e "  \033[1;33m 2\033[0m. 修改端口"
-    echo -e "  \033[1;34m 3\033[0m. 修改路径"
-    echo -e "  \033[1;35m 4\033[0m. 修改传输协议"
-    echo -e "  \033[1;36m 5\033[0m. 切换 CF→VPS 加密"
-    echo -e "  \033[1;37m 6\033[0m. 全部修改"
-    echo -e "  \033[1;31m 0\033[0m. 返回"
-    echo
-    read -rp "$(echo -e "\033[1;33m请选择 [0-6]: \033[0m")" mc
+echo -e "  \033[1;33m 2\033[0m. 修改端口"
+	    echo -e "  \033[1;34m 3\033[0m. 修改路径"
+	    if [[ "$protocol" == "reality" ]]; then
+	        echo -e "  \033[1;35m 4\033[0m. 修改 Reality 伪装目标/SNI"
+	        echo -e "  \033[1;36m 5\033[0m. 绑定/更换 CF 域名（不开代理）"
+	        echo -e "  \033[1;31m 6\033[0m. 取消 CF 域名绑定"
+	        echo -e "  \033[1;37m 7\033[0m. 重新生成 Reality 密钥"
+	        echo -e "  \033[1;38m 8\033[0m. 全部修改"
+	    else
+	        echo -e "  \033[1;35m 4\033[0m. 修改传输协议"
+	        echo -e "  \033[1;36m 5\033[0m. 切换 CF→VPS 加密"
+	        echo -e "  \033[1;37m 6\033[0m. 全部修改"
+	    fi
+	    echo -e "  \033[1;31m 0\033[0m. 返回"
+	    echo
+	    read -rp "$(echo -e "\033[1;33m请选择 [0-8]: \033[0m")" mc
 
-    local new_uid="$uid" new_route="$route_json" changed=false
+	    local new_uid="$uid" new_route="$route_json" changed=false
+	    local max_choice=8
+	    [[ "$protocol" != "reality" ]] && max_choice=6
 
-    [[ "$mc" =~ ^[0-6]$ ]] || { echo "无效选项"; return; }
-    [[ "$mc" == "0" ]] && return
+	    [[ "$mc" =~ ^[0-8]$ ]] || { echo "无效选项"; return; }
+	    [[ "$mc" == "0" ]] && return
 
+    # ── 1. UUID ──
     if [[ "$mc" == "1" || "$mc" == "6" ]]; then
         while true; do
             read -rp "新 UUID(留空=重新生成): " iu
@@ -1085,34 +1214,24 @@ do_modify() {
         changed=true; ok "UUID: $new_uid"
     fi
 
+    # ── 2. 端口 ──
     if [[ "$mc" == "2" || "$mc" == "6" ]]; then
-        if [[ "$net_mode" == "nat" ]]; then
-            local lp cp
-            lp=$(echo "$new_route" | jq -r '.listen_port')
-            cp=$(echo "$new_route" | jq -r '.cf_port')
-            read -rp "内部监听端口(当前=$lp): " new_lp
-            read -rp "外部映射端口(当前=$cp): " new_cp
-            if [[ -n "$new_lp" ]]; then
-                [[ "$new_lp" =~ ^[0-9]+$ ]] && lp="$new_lp" || { echo "无效端口: $new_lp"; return; }
-            fi
-            if [[ -n "$new_cp" ]]; then
-                [[ "$new_cp" =~ ^[0-9]+$ ]] && cp="$new_cp" || { echo "无效端口: $new_cp"; return; }
-            fi
-            new_route=$(echo "$new_route" | jq --argjson lp "$((lp))" --argjson cp "$((cp))" '.listen_port=$lp|.cf_port=$cp')
-            changed=true; ok "端口已更新"
-        else
-            local p; p=$(echo "$new_route" | jq -r '.listen_port')
-            read -rp "新端口(当前=$p): " np
-            if [[ -n "$np" ]]; then
-                [[ "$np" =~ ^[0-9]+$ ]] || { echo "无效端口: $np"; return; }
+        local p; p=$(echo "$new_route" | jq -r '.listen_port')
+        read -rp "新端口(当前=$p): " np
+        if [[ -n "$np" ]]; then
+            [[ "$np" =~ ^[0-9]+$ ]] || { echo "无效端口: $np"; return; }
+            if [[ "$protocol" == "reality" ]]; then
                 new_route=$(echo "$new_route" | jq --argjson p "$((np))" '.listen_port=$p|.cf_port=$p')
-                changed=true; ok "端口已更新"
+            else
+                new_route=$(echo "$new_route" | jq --argjson p "$((np))" '.listen_port=$p|.cf_port=$p')
             fi
+            changed=true; ok "端口已更新: $np"
         fi
     fi
 
+    # ── 3. 路径 ──
     if [[ "$mc" == "3" || "$mc" == "6" ]]; then
-        local cur_path; cur_path=$(echo "$new_route" | jq -r '.path')
+        local cur_path; cur_path=$(echo "$new_route" | jq -r '.path // "/reality"')
         read -rp "新路径(当前=$cur_path，留空=不改): " np
         if [[ -n "$np" ]]; then
             [[ "$np" == /* ]] || np="/${np}"
@@ -1121,40 +1240,124 @@ do_modify() {
         fi
     fi
 
-    if [[ "$mc" == "4" || "$mc" == "6" ]]; then
-        local cur_tr; cur_tr=$(echo "$new_route" | jq -r '.transport // "websocket"')
-        echo "当前传输协议: $cur_tr"
-        new_tr=$(prompt_transport)
-        new_route=$(echo "$new_route" | jq --arg t "$new_tr" '.transport=$t')
-        changed=true; ok "传输协议: $new_tr"
-    fi
-
-    if [[ "$mc" == "5" || "$mc" == "6" ]]; then
-        local cur_tls; cur_tls=$(echo "$new_route" | jq -r '.tls // false')
-        if [[ "$cur_tls" == "true" ]]; then
-            echo "当前: 已启用 CF→VPS 加密"
-            read -rp "关闭加密? (y/N): " off_tls
-            if [[ "${off_tls,,}" == "y" || "${off_tls,,}" == "yes" ]]; then
-                new_route=$(echo "$new_route" | jq '.tls=false')
-                changed=true; ok "CF→VPS 加密: 已关闭"
-                local _revoke_after=true
+    # ── Reality 专属选项 ──
+    if [[ "$protocol" == "reality" ]]; then
+        # ── 4. Reality 伪装目标/SNI ──
+        if [[ "$mc" == "4" || "$mc" == "8" ]]; then
+            local cur_target cur_sni
+            cur_target=$(echo "$new_route" | jq -r '.reality_target')
+            cur_sni=$(echo "$new_route" | jq -r '.reality_server_name')
+            read -rp "伪装目标(当前=$cur_target，留空=不改): " new_target
+            if [[ -n "$new_target" ]]; then
+                new_target="${new_target#http://}"; new_target="${new_target#https://}"; new_target="${new_target%%/*}"
+                [[ "$new_target" == *:* ]] || new_target="${new_target}:443"
+                local new_sni="${new_target%%:*}"
+                read -rp "SNI(当前=$cur_sni，留空=使用新伪装目标域名): " sni_input
+                new_sni="${sni_input:-$new_sni}"
+                new_route=$(echo "$new_route" | jq --arg t "$new_target" --arg s "$new_sni" \
+                    '.reality_target=$t|.reality_server_name=$s')
+                changed=true; ok "伪装目标: $new_target  SNI: $new_sni"
             fi
-        else
-            echo "当前: 未启用 CF→VPS 加密"
-            read -rp "开启加密? (y/N): " on_tls
-            if [[ "${on_tls,,}" == "y" || "${on_tls,,}" == "yes" ]]; then
-                new_route=$(echo "$new_route" | jq '.tls=true')
-                changed=true; ok "CF→VPS 加密: 已开启"
-                local _gen_cert_after=true
+        fi
+
+        # ── 5. 绑定/更换 CF 域名（不开代理）──
+        if [[ "$mc" == "5" || "$mc" == "8" ]]; then
+            local cur_cf_domain; cur_cf_domain=$(echo "$new_route" | jq -r '.cf_domain // ""')
+            if [[ -n "$cur_cf_domain" ]]; then
+                echo "当前绑定域名: $cur_cf_domain"
+                read -rp "更换域名? (Y/n，默认 N): " change_yn
+                if [[ "${change_yn,,}" == "y" || "${change_yn,,}" == "yes" ]]; then
+                    if ! load_cf_account; then echo "需要 CF 凭据以创建 DNS 记录"; prompt_cf; fi
+                    local selected_zone
+                    selected_zone=$(prompt_select_zone)
+                    local zone_domain="${selected_zone%%|*}"
+                    local new_zone_id="${selected_zone##*|}"
+                    local raw_ip; raw_ip=$(get_public_ip)
+                    cf_upsert_dns_unproxied "$new_zone_id" "$zone_domain" "$raw_ip" >/dev/null
+                    ok "DNS A 记录已创建: $zone_domain -> $raw_ip（不开代理）"
+                    new_route=$(echo "$new_route" | jq --arg d "$zone_domain" --arg cf "$zone_domain" --arg zid "$new_zone_id" \
+                        '.domain=$d|.cf_domain=$cf|.cf_zone_id=$zid')
+                    changed=true; ok "更换域名: $zone_domain"
+                fi
+            else
+                echo "当前未绑定域名"
+                read -rp "绑定 CF 域名隐藏 IP? (Y/n，默认 N): " bind_yn
+                if [[ "${bind_yn,,}" == "y" || "${bind_yn,,}" == "yes" ]]; then
+                    if ! load_cf_account; then echo "需要 CF 凭据以创建 DNS 记录"; prompt_cf; fi
+                    local selected_zone
+                    selected_zone=$(prompt_select_zone)
+                    local zone_domain="${selected_zone%%|*}"
+                    local new_zone_id="${selected_zone##*|}"
+                    local raw_ip; raw_ip=$(get_public_ip)
+                    cf_upsert_dns_unproxied "$new_zone_id" "$zone_domain" "$raw_ip" >/dev/null
+                    ok "DNS A 记录已创建: $zone_domain -> $raw_ip（不开代理）"
+                    new_route=$(echo "$new_route" | jq --arg d "$zone_domain" --arg cf "$zone_domain" --arg zid "$new_zone_id" \
+                        '.domain=$d|.cf_domain=$cf|.cf_zone_id=$zid')
+                    changed=true; ok "绑定域名: $zone_domain"
+                fi
+            fi
+        fi
+
+        # ── 6. 取消 CF 域名绑定 ──
+        if [[ "$mc" == "6" ]]; then
+            local cur_cf_domain; cur_cf_domain=$(echo "$new_route" | jq -r '.cf_domain // ""')
+            if [[ -n "$cur_cf_domain" ]]; then
+                local raw_ip; raw_ip=$(get_public_ip)
+                new_route=$(echo "$new_route" | jq --arg d "$raw_ip" '.domain=$d|.cf_domain=""|.cf_zone_id=""')
+                changed=true; ok "已取消 CF 域名绑定，恢复为 IP: $raw_ip"
+            else
+                echo "当前未绑定 CF 域名，无需取消"
+            fi
+        fi
+
+        # ── 7. 重新生成 Reality 密钥 ──
+        if [[ "$mc" == "7" || "$mc" == "8" ]]; then
+            local keys new_private_key new_public_key new_short_id
+            keys=$(gen_reality_keys) || die "Reality 密钥生成失败"
+            new_private_key=$(echo "$keys" | jq -r '.private')
+            new_public_key=$(echo "$keys" | jq -r '.public')
+            new_short_id=$(openssl rand -hex 8)
+            new_route=$(echo "$new_route" | jq --arg pk "$new_private_key" --arg pub "$new_public_key" --arg sid "$new_short_id" \
+                '.reality_private_key=$pk|.reality_public_key=$pub|.reality_short_id=$sid')
+            changed=true; ok "Reality 密钥已重新生成"
+        fi
+    else
+        # ── CF VLESS 选项 ──
+        # ── 4. 传输协议 ──
+        if [[ "$mc" == "4" || "$mc" == "6" ]]; then
+            local cur_tr; cur_tr=$(echo "$new_route" | jq -r '.transport // "websocket"')
+            echo "当前传输协议: $cur_tr"
+            new_tr=$(prompt_transport)
+            new_route=$(echo "$new_route" | jq --arg t "$new_tr" '.transport=$t')
+            changed=true; ok "传输协议: $new_tr"
+        fi
+
+        # ── 5. CF→VPS 加密 ──
+        if [[ "$mc" == "5" || "$mc" == "6" ]]; then
+            local cur_tls; cur_tls=$(echo "$new_route" | jq -r '.tls // false')
+            if [[ "$cur_tls" == "true" ]]; then
+                echo "当前: 已启用 CF→VPS 加密"
+                read -rp "关闭加密? (y/N): " off_tls
+                if [[ "${off_tls,,}" == "y" || "${off_tls,,}" == "yes" ]]; then
+                    new_route=$(echo "$new_route" | jq '.tls=false')
+                    changed=true; ok "CF→VPS 加密: 已关闭"
+                    local _revoke_after=true
+                fi
+            else
+                echo "当前: 未启用 CF→VPS 加密"
+                read -rp "开启加密? (y/N): " on_tls
+                if [[ "${on_tls,,}" == "y" || "${on_tls,,}" == "yes" ]]; then
+                    new_route=$(echo "$new_route" | jq '.tls=true')
+                    changed=true; ok "CF→VPS 加密: 已开启"
+                    local _gen_cert_after=true
+                fi
             fi
         fi
     fi
 
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
 
-    new_route=$(echo "$new_route" | jq --arg d "$domain" '.domain=$d')
-
-    # 处理 TLS 变更的实际操作（在重启 xray 之前）
+    # 处理 TLS 变更的实际操作（仅 CF VLESS 模式）
     if [[ "${_gen_cert_after:-}" == "true" ]]; then
         load_cf_account || die "未找到 CF 凭据"
         gen_origin_cert "$domain"
@@ -1171,18 +1374,34 @@ do_modify() {
     write_xray_config "$(gen_xray_config "$new_route" "$new_uid")"
     restart_xray
 
-    if load_cf_account; then
+    if [[ "$protocol" != "reality" ]] && load_cf_account; then
         apply_origin_rule "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_route"
         ok "Origin Rule 已更新"
     fi
 
-    local link; link=$(build_link "$new_uid" "$domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "websocket"')" "$(echo "$new_route" | jq -r '.cf_port')" "$(echo "$new_route" | jq -r '.tls')")
-    local sub_link; sub_link=$(build_sub_link "$link")
-    save_links_snapshot "$domain" "$new_uid" "$link" "$sub_link"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_route" --arg l "$link" \
-        '.uuid=$u|.route=$r|.link=$l')"
-
-    echo; ok "配置已更新"; print_link "$link"
+    local new_domain; new_domain=$(echo "$new_route" | jq -r '.domain')
+    local link
+    if [[ "$protocol" == "reality" ]]; then
+        local _path _spider_x
+        _path=$(echo "$new_route" | jq -r '.path // "/reality"')
+        _spider_x="$(openssl rand -hex 12)"
+        link=$(build_reality_link "$new_uid" "$new_domain" "$(echo "$new_route" | jq -r '.listen_port')" \
+            "$(echo "$new_route" | jq -r '.reality_server_name')" \
+            "$(echo "$new_route" | jq -r '.reality_public_key')" \
+            "$(echo "$new_route" | jq -r '.reality_short_id')" \
+            "$_path" "$_spider_x")
+        save_links_snapshot "$new_domain" "$new_uid" "$link"
+        save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_route" --arg l "$link" \
+            '.uuid=$u|.route=$r|.link=$l')"
+        echo; ok "配置已更新"; print_vless "$link"
+    else
+        link=$(build_link "$new_uid" "$new_domain" "$(echo "$new_route" | jq -r '.path')" "$(echo "$new_route" | jq -r '.transport // "websocket"')" "$(echo "$new_route" | jq -r '.cf_port')" "$(echo "$new_route" | jq -r '.tls')")
+        local sub_link; sub_link=$(build_sub_link "$link")
+        save_links_snapshot "$new_domain" "$new_uid" "$link" "$sub_link"
+        save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_route" --arg l "$link" \
+            '.uuid=$u|.route=$r|.link=$l')"
+        echo; ok "配置已更新"; print_link "$sub_link"
+    fi
 }
 
 # ── 5. 查看当前配置 ──────────────────────────────────
@@ -1190,25 +1409,42 @@ do_show_config() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || { echo "未检测到部署"; return; }
 
+    local domain; domain=$(echo "$state" | jq -r '.domain')
+    local protocol; protocol=$(echo "$state" | jq -r '.route.protocol // "vless"')
+
     echo
     header "═══════════════════════════════════"
     header "         当前配置信息"
     header "═══════════════════════════════════"
     echo
-    echo -e "  \033[1;36m域名:\033[0m    $(echo "$state" | jq -r '.domain')"
+    if [[ "$protocol" == "reality" ]]; then
+        local cf_domain; cf_domain=$(echo "$state" | jq -r '.route.cf_domain // ""')
+        echo -e "  \033[1;36m节点地址:\033[0m $domain"
+        [[ -n "$cf_domain" ]] && echo -e "  \033[1;36m绑定域名:\033[0m $cf_domain"
+    else
+        echo -e "  \033[1;36m域名:\033[0m    $domain"
+    fi
     echo -e "  \033[1;36mUUID:\033[0m    $(echo "$state" | jq -r '.uuid')"
     echo -e "  \033[1;36m模式:\033[0m    $(echo "$state" | jq -r '.net_mode // "direct"')"
     echo -e "  \033[1;36m传输协议:\033[0m $(echo "$state" | jq -r '.route.transport // "websocket"')"
     echo -e "  \033[1;36mCF→VPS加密:\033[0m $(echo "$state" | jq -r '.route.tls // false')"
     echo -e "  \033[1;36m端口:\033[0m    $(echo "$state" | jq -r '.route.listen_port')"
-    echo -e "  \033[1;36mCF端口:\033[0m  $(echo "$state" | jq -r '.route.cf_port')"
-    echo -e "  \033[1;36m路径:\033[0m    $(echo "$state" | jq -r '.route.path')"
+    if [[ "$protocol" == "reality" ]]; then
+        echo -e "  \033[1;36mReality SNI:\033[0m $(echo "$state" | jq -r '.route.reality_server_name')"
+        echo -e "  \033[1;36m伪装目标:\033[0m  $(echo "$state" | jq -r '.route.reality_target')"
+    else
+        echo -e "  \033[1;36mCF端口:\033[0m  $(echo "$state" | jq -r '.route.cf_port')"
+    fi
+    echo -e "  \033[1;36m路径:\033[0m    $(echo "$state" | jq -r '.route.path // "/reality"')"
     echo
     echo -ne "  \033[1;36mxray:\033[0m    "; svc_is_active && ok "运行中" || warn "未运行"
     echo
     header "───────────────────────────────────"
-    echo -e "  \033[1;35m订阅:\033[0m"
-    print_link "$(echo "$state" | jq -r '.link')"
+    if [[ "$protocol" == "reality" ]]; then
+        print_vless "$(echo "$state" | jq -r '.link')"
+    else
+        print_link "$(build_sub_link "$(echo "$state" | jq -r '.link')")"
+    fi
     echo
 }
 
@@ -1276,7 +1512,7 @@ do_update_ports() {
     save_links_snapshot "$domain" "$uid" "$link" "$sub_link"
     save_state "$(echo "$state" | jq --argjson r "$new_route" --arg l "$link" '.route=$r|.link=$l')"
 
-    echo; ok "外部端口已更新"; print_link "$link"
+    echo; ok "外部端口已更新"; print_link "$sub_link"
 }
 
 # ── 7. 更新 xray ─────────────────────────────────────
@@ -1341,11 +1577,7 @@ do_logs() {
     header "         xray 运行日志"
     header "═══════════════════════════════════"
     echo
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        journalctl -u xray --no-pager -n 30 --output cat 2>/dev/null || echo "暂无日志"
-    else
-        cat /var/log/xray.log 2>/dev/null || echo "暂无日志"
-    fi
+    journalctl -u xray --no-pager -n 30 --output cat 2>/dev/null || echo "暂无日志"
     echo
     read -rp "$(echo -e "\033[1;33m按回车返回\033[0m")"
 }
@@ -1446,7 +1678,7 @@ SCEOF
 
 main() {
     [[ "$(id -u)" == "0" ]] || die "请使用 root 运行此脚本"
-    detect_init
+    require_systemd
     install_deps
     need_cmd curl; need_cmd jq; need_cmd openssl
     ensure_shortcut
@@ -1467,8 +1699,7 @@ main() {
         local bbr_status; bbr_status=$(get_bbr_status)
 
         echo
-        local title="xray-cf ($INIT_SYSTEM)"
-        echo -e "  \033[1;36m$title\033[0m"
+        echo -e "  \033[1;36mxray-cf\033[0m"
         local info=""
         if [[ -n "$current_domain" ]]; then
             info+="\033[33m$current_domain\033[0m"
@@ -1478,7 +1709,9 @@ main() {
             [[ -n "$net_mode" ]] && info+=" \033[37m[$net_mode]\033[0m"
             info+="  \033[37m|\033[0m  "
         fi
-        if svc_is_active; then
+        if [[ ! -x "$XRAY_BINARY" ]]; then
+            info+="xray \033[31m● 未安装\033[0m"
+        elif svc_is_active; then
             info+="xray \033[32m● 运行中\033[0m"
         else
             info+="xray \033[31m● 已关闭\033[0m"
@@ -1487,17 +1720,11 @@ main() {
         if svc_is_active; then
             local ver mem pid uptime
             ver=$(get_xray_version || echo "?")
-            if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-                mem=$(systemctl show xray -p MemoryCurrent --value 2>/dev/null)
-                mem=$(awk -v m="$mem" 'BEGIN{if (m>1048576) printf "%.1f MB", m/1048576; else printf "%.1f KB", m/1024}')
-                pid=$(systemctl show xray -p MainPID --value 2>/dev/null)
-                uptime=$(systemctl show xray -p ActiveEnterTimestamp --value 2>/dev/null)
-                uptime=$(date -d "$uptime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$uptime")
-            else
-                pid=$(cat /run/xray.pid 2>/dev/null || echo "?")
-                mem="N/A"
-                uptime="N/A"
-            fi
+            mem=$(systemctl show xray -p MemoryCurrent --value 2>/dev/null)
+            mem=$(awk -v m="$mem" 'BEGIN{if (m>1048576) printf "%.1f MB", m/1048576; else printf "%.1f KB", m/1024}')
+            pid=$(systemctl show xray -p MainPID --value 2>/dev/null)
+            uptime=$(systemctl show xray -p ActiveEnterTimestamp --value 2>/dev/null)
+            uptime=$(date -d "$uptime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$uptime")
             echo -e "     \033[36mv${ver}\033[0m  \033[33mPID:${pid}\033[0m  \033[35m内存:${mem}\033[0m  \033[37m启动:${uptime}\033[0m"
         fi
         echo
