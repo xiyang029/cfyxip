@@ -29,16 +29,22 @@ curl -sSfL -o xray-cf.sh https://raw.githubusercontent.com/xiyang029/cfyxip/refs
 chmod +x xray-cf.sh
 ```
 
-该脚本为 Xray + Cloudflare 一键部署工具，支持安装、卸载、配置修改、订阅查看等功能。运行方式：
+该脚本为 Xray / sing-box + Cloudflare 一键部署工具，支持安装、卸载、配置修改、订阅查看等功能。
+
+### 支持协议
+
+| 协议 | 内核 | 说明 |
+|------|------|------|
+| CF VLESS (WS / XHTTP) | xray | 走 Cloudflare CDN |
+| Reality 直连 (xhttp) | xray | 直连，可选绑定 CF 域名隐藏 IP |
+| Hysteria2 | sing-box | UDP/QUIC 直连，可选 salamander 混淆 |
+| TUIC | sing-box | UDP/QUIC 直连 |
+
+内核均使用官方安装脚本安装 **pre-release / beta** 版本。
 
 ```bash
 # 交互式运行
 sudo bash xray-cf.sh
-
-# 或直接指定操作
-sudo bash xray-cf.sh install   # 安装
-sudo bash xray-cf.sh uninstall # 卸载
-sudo bash xray-cf.sh show      # 查看订阅
 ```
 
 ## IP 来源
