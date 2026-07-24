@@ -25,8 +25,8 @@ Node.js 原生模块，无需安装额外依赖。
 ## Linux 获取 xray-cf.sh 脚本
 
 ```bash
-curl -sSfL -o xray-cf.sh https://raw.githubusercontent.com/xiyang029/cfyxip/refs/heads/main/xray-cf.sh
-chmod +x xray-cf.sh
+curl -sSfL -o xray-singbox-cf.sh https://raw.githubusercontent.com/xiyang029/cfyxip/refs/heads/main/xray-singbox-cf.sh
+chmod +x xray-singbox-cf.sh
 ```
 
 该脚本为 Xray / sing-box + Cloudflare 一键部署工具，支持安装、卸载、配置修改、订阅查看等功能。

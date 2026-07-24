@@ -139,6 +139,37 @@ check_singbox_update() {
     SINGBOX_UPDATE_STATUS="$status"
 }
 
+check_core_updates() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    (
+        check_xray_update
+        jq -n --arg c "$XRAY_UPDATE_CURRENT" --arg l "$XRAY_UPDATE_LATEST" --arg s "$XRAY_UPDATE_STATUS" \
+            '{current:$c,latest:$l,status:$s}' > "$tmpdir/xray.json"
+    ) &
+    local xray_pid=$!
+    (
+        check_singbox_update
+        jq -n --arg c "$SINGBOX_UPDATE_CURRENT" --arg l "$SINGBOX_UPDATE_LATEST" --arg s "$SINGBOX_UPDATE_STATUS" \
+            '{current:$c,latest:$l,status:$s}' > "$tmpdir/singbox.json"
+    ) &
+    local singbox_pid=$!
+    wait "$xray_pid" 2>/dev/null || true
+    wait "$singbox_pid" 2>/dev/null || true
+
+    if [[ -s "$tmpdir/xray.json" ]]; then
+        XRAY_UPDATE_CURRENT=$(jq -r '.current // ""' "$tmpdir/xray.json")
+        XRAY_UPDATE_LATEST=$(jq -r '.latest // ""' "$tmpdir/xray.json")
+        XRAY_UPDATE_STATUS=$(jq -r '.status // ""' "$tmpdir/xray.json")
+    fi
+    if [[ -s "$tmpdir/singbox.json" ]]; then
+        SINGBOX_UPDATE_CURRENT=$(jq -r '.current // ""' "$tmpdir/singbox.json")
+        SINGBOX_UPDATE_LATEST=$(jq -r '.latest // ""' "$tmpdir/singbox.json")
+        SINGBOX_UPDATE_STATUS=$(jq -r '.status // ""' "$tmpdir/singbox.json")
+    fi
+    rm -rf "$tmpdir"
+}
+
 # 协议 → 内核
 kernel_for_protocol() {
     case "${1:-}" in
@@ -233,6 +264,42 @@ svc_is_active() {
     systemctl is-active "$unit" &>/dev/null
 }
 
+svc_has_binary() {
+    case "${1:-$ACTIVE_KERNEL}" in
+        singbox|sing-box) resolve_singbox_binary &>/dev/null ;;
+        *)                [[ -x "$XRAY_BINARY" ]] ;;
+    esac
+}
+
+svc_status_text() {
+    local kernel="${1:-$ACTIVE_KERNEL}" unit
+    unit=$(svc_unit "$kernel")
+    if svc_is_active "$kernel"; then
+        printf '%s \033[32m● 运行中\033[0m' "$unit"
+    elif svc_has_binary "$kernel"; then
+        printf '%s \033[31m● 已关闭\033[0m' "$unit"
+    else
+        printf '%s \033[31m● 未安装\033[0m' "$unit"
+    fi
+}
+
+print_service_detail() {
+    local kernel="$1" unit ver mem pid uptime
+    svc_is_active "$kernel" || return 0
+    unit=$(svc_unit "$kernel")
+    if [[ "$kernel" == "singbox" || "$kernel" == "sing-box" ]]; then
+        ver=$(get_singbox_version || echo "?")
+    else
+        ver=$(get_xray_version || echo "?")
+    fi
+    mem=$(systemctl show "$unit" -p MemoryCurrent --value 2>/dev/null)
+    mem=$(awk -v m="$mem" 'BEGIN{if (m+0==0) print "?"; else if (m>1048576) printf "%.1f MB", m/1048576; else printf "%.1f KB", m/1024}')
+    pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
+    uptime=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null)
+    uptime=$(date -d "$uptime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$uptime")
+    echo -e "     \033[2;37m$unit\033[0m  \033[36mv${ver}\033[0m  \033[33mPID:${pid}\033[0m  \033[35m内存:${mem}\033[0m  \033[37m启动:${uptime}\033[0m"
+}
+
 ensure_systemd_restart() {
     local unit drop
     unit=$(svc_unit "${1:-}")
@@ -250,11 +317,11 @@ SDEOF
 
 # 证书权限：兼容 xray 与 sing-box 运行用户
 fix_service_cert_permissions() {
-    local cert_dir="$1" key_file="$2" crt_file="${3:-}"
+    local key_file="$1" crt_file="${2:-}"
     [[ -f "$key_file" ]] || return 0
 
     local unit service_user service_group
-    unit=$(svc_unit "${4:-}")
+    unit=$(svc_unit "${3:-}")
     service_user=$(systemctl show "$unit" -p User --value 2>/dev/null || true)
     service_group=$(systemctl show "$unit" -p Group --value 2>/dev/null || true)
     service_user="${service_user:-root}"
@@ -273,7 +340,8 @@ fix_service_cert_permissions() {
 }
 
 restart_xray() {
-    fix_origin_cert_permissions
+    fix_service_cert_permissions "$XRAY_CONFIG_DIR/origin.key" \
+        "$XRAY_CONFIG_DIR/origin.crt" "xray"
     ensure_systemd_restart "xray"
     svc_enable "xray"
     svc_start "xray" || die "xray 重启失败"
@@ -283,8 +351,8 @@ restart_xray() {
 }
 
 restart_singbox() {
-    fix_service_cert_permissions "$SINGBOX_CONFIG_DIR" \
-        "$SINGBOX_CONFIG_DIR/server.key" "$SINGBOX_CONFIG_DIR/server.crt" "singbox"
+    fix_service_cert_permissions "$SINGBOX_CONFIG_DIR/server.key" \
+        "$SINGBOX_CONFIG_DIR/server.crt" "singbox"
     ensure_systemd_restart "singbox"
     svc_enable "singbox"
     svc_start "singbox" || die "sing-box 重启失败"
@@ -329,8 +397,8 @@ get_public_ip() {
 }
 
 detect_nat() {
-    local public_ip
-    public_ip=$(get_public_ip)
+    local public_ip="${1:-}"
+    [[ -n "$public_ip" ]] || public_ip=$(get_public_ip)
     if ip addr show 2>/dev/null | grep -q "inet ${public_ip}/"; then
         echo "direct"
     else
@@ -581,27 +649,6 @@ apply_origin_rule() {
 }
 
 # ── CF 源证书 ─────────────────────────────────────────
-fix_origin_cert_permissions() {
-    [[ -f "$XRAY_CONFIG_DIR/origin.key" ]] || return 0
-
-    local service_user service_group
-    service_user=$(systemctl show xray -p User --value 2>/dev/null || true)
-    service_group=$(systemctl show xray -p Group --value 2>/dev/null || true)
-    service_user="${service_user:-root}"
-    if [[ -z "$service_group" ]]; then
-        service_group=$(id -gn "$service_user" 2>/dev/null || true)
-    fi
-    service_group="${service_group:-root}"
-
-    if chown "$service_user:$service_group" "$XRAY_CONFIG_DIR/origin.key" 2>/dev/null; then
-        chmod 640 "$XRAY_CONFIG_DIR/origin.key"
-    else
-        warn "无法设置私钥归属，降级使用 644 权限"
-        chmod 644 "$XRAY_CONFIG_DIR/origin.key" || die "无法设置源证书私钥权限"
-    fi
-    chmod 644 "$XRAY_CONFIG_DIR/origin.crt" 2>/dev/null || true
-}
-
 gen_origin_cert() {
     local domain="$1"
     info "正在生成 CF 源证书..."
@@ -629,7 +676,8 @@ gen_origin_cert() {
     fi
     echo "$resp" | jq -r '.result.certificate' > "$XRAY_CONFIG_DIR/origin.crt"
     # 设置权限：xray 运行用户需要可读
-    fix_origin_cert_permissions
+    fix_service_cert_permissions "$XRAY_CONFIG_DIR/origin.key" \
+        "$XRAY_CONFIG_DIR/origin.crt" "xray"
     ok "源证书已签名: $XRAY_CONFIG_DIR/origin.crt"
     ok "有效期: $(echo "$resp" | jq -r '.result.expires_on // "未知"')"
 }
@@ -689,7 +737,7 @@ gen_self_signed_cert() {
             cn=$(openssl x509 -in "$crt" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | head -1)
             if [[ -z "$domain" || "$cn" == "$domain" || "$domain" =~ ^[0-9.]+$ ]]; then
                 info "复用已有自签证书: $crt"
-                fix_service_cert_permissions "$SINGBOX_CONFIG_DIR" "$key" "$crt" "singbox"
+                fix_service_cert_permissions "$key" "$crt" "singbox"
                 return 0
             fi
         fi
@@ -709,7 +757,7 @@ gen_self_signed_cert() {
 
     chmod 640 "$key" 2>/dev/null || chmod 600 "$key"
     chmod 644 "$crt"
-    fix_service_cert_permissions "$SINGBOX_CONFIG_DIR" "$key" "$crt" "singbox"
+    fix_service_cert_permissions "$key" "$crt" "singbox"
     ok "自签证书已生成: $crt"
 }
 
@@ -875,7 +923,9 @@ gen_singbox_config() {
                 listen_port: $port,
                 users: [{name: "user", uuid: $uuid, password: $pwd}],
                 congestion_control: $cc,
+                auth_timeout: "3s",
                 zero_rtt_handshake: false,
+                heartbeat: "10s",
                 tls: $tls
             }')
             ;;
@@ -886,7 +936,7 @@ gen_singbox_config() {
     esac
 
     jq -n --argjson inbound "$inbound" '{
-        log: {level: "warn", timestamp: true},
+        log: {level: "info", timestamp: true},
         inbounds: [$inbound],
         outbounds: [
             {type: "direct", tag: "direct"},
@@ -918,13 +968,6 @@ write_singbox_config() {
     ok "sing-box 配置已写入 $SINGBOX_CONFIG_PATH"
 }
 
-write_proxy_config() {
-    local kernel="${2:-$ACTIVE_KERNEL}"
-    case "$kernel" in
-        singbox|sing-box) write_singbox_config "$1" ;;
-        *)                write_xray_config "$1" ;;
-    esac
-}
 # ── 订阅链接 ─────────────────────────────────────────
 build_link() {
     local uid="$1" domain="$2" path="$3" transport="$4" cf_port="$5" tls_enabled="$6"
@@ -945,7 +988,7 @@ build_reality_link() {
 }
 
 # Hysteria2 分享链接
-# hy2://password@host:port?sni=...&insecure=1&obfs=salamander&obfs-password=...#name
+# hysteria2://password@host:port?sni=...&insecure=1&obfs=salamander&obfs-password=...#name
 build_hy2_link() {
     local password="$1" address="$2" port="$3" sni="$4" insecure="${5:-1}" obfs_type="${6:-}" obfs_password="${7:-}"
     local name="HY2-${address}"
@@ -953,7 +996,7 @@ build_hy2_link() {
     if [[ -n "$obfs_type" && "$obfs_type" != "none" && -n "$obfs_password" ]]; then
         qs+="&obfs=$(urlencode "$obfs_type")&obfs-password=$(urlencode "$obfs_password")"
     fi
-    echo "hy2://$(urlencode "$password")@${address}:${port}?${qs}#${name}"
+    echo "hysteria2://$(urlencode "$password")@${address}:${port}?${qs}#${name}"
 }
 
 # TUIC v5 分享链接
@@ -1111,19 +1154,19 @@ prompt_transport() {
 
 prompt_protocol() {
     while true; do
-        echo
-        echo -e "  \033[1;32m 1\033[0m. CF VLESS          \033[2;37m(xray + Cloudflare CDN)\033[0m"
-        echo -e "  \033[1;32m 2\033[0m. Reality 直连      \033[2;37m(xray + xhttp + Reality)\033[0m"
-        echo -e "  \033[1;35m 3\033[0m. Hysteria2 直连    \033[2;37m(sing-box · UDP/QUIC)\033[0m"
-        echo -e "  \033[1;35m 4\033[0m. TUIC 直连         \033[2;37m(sing-box · UDP/QUIC)\033[0m"
-        echo
-        read -rp "节点协议(1-4，留空=CF VLESS): " protocol_raw
+        echo >&2
+        echo -e "  \033[1;32m 1\033[0m. CF VLESS       \033[2;37m(xray + Cloudflare CDN)[0m" >&2
+        echo -e "  \033[1;32m 2\033[0m. Reality 直连   \033[2;37m(xray + XHTTP + Reality)[0m" >&2
+        echo -e "  \033[1;35m 3\033[0m. Hysteria2 直连 \033[2;37m(sing-box + UDP/QUIC)[0m" >&2
+        echo -e "  \033[1;35m 4\033[0m. TUIC 直连      \033[2;37m(sing-box + UDP/QUIC)[0m" >&2
+        echo >&2
+        read -rp "节点协议 [1 CF VLESS / 2 Reality / 3 HY2 / 4 TUIC，回车=1]: " protocol_raw
         case "${protocol_raw:-1}" in
             1|vless|cf)              echo "vless"; return ;;
             2|reality)               echo "reality"; return ;;
             3|hy2|hysteria2|hysteria) echo "hy2"; return ;;
             4|tuic)                  echo "tuic"; return ;;
-            *) echo "无效协议: $protocol_raw，请重新选择" ;;
+            *) echo "无效协议: $protocol_raw，请重新选择" >&2 ;;
         esac
     done
 }
@@ -1202,23 +1245,6 @@ prompt_tls() {
     esac
 }
 
-# ── 端口检测 ──────────────────────────────────────────
-CF_PROXY_PORTS=(443 80 2053 2083 2087 2096 8443)
-
-check_ports_status() {
-    local p
-    echo >&2
-    echo -e "  \033[1;36mCF 可用端口状态:\033[0m" >&2
-    for p in "${CF_PROXY_PORTS[@]}"; do
-        if ss -tln 2>/dev/null | grep -qE ":$p\s"; then
-            echo -e "    \033[31m✗ $p\033[0m  (被占用)" >&2
-        else
-            echo -e "    \033[32m✓ $p\033[0m  (可用)" >&2
-        fi
-    done
-    echo >&2
-}
-
 # ── 生成单条 vless 路由 JSON
 build_route() {
     local net_mode="$1" path_prefix="$2" transport="$3" tls_enabled="$4"
@@ -1251,7 +1277,7 @@ do_install_reality() {
     local address port target server_name short_id keys route_json config link state_json net_mode
 
     address=$(get_public_ip)
-    net_mode=$(detect_nat)
+    net_mode=$(detect_nat "$address")
     if [[ "$net_mode" == "nat" ]]; then
         warn "检测到 NAT/内网网卡（如 AWS EIP）：公网 IP 未绑定到本机网卡"
         info "请确认云厂商安全组/防火墙已放行 Reality 监听端口入站"
@@ -1283,7 +1309,7 @@ do_install_reality() {
     local priv_key; priv_key=$(echo "$keys" | jq -r '.private')
 
     # ── 可选绑定 CF 域名（不开代理）──
-    local cf_domain="" cf_zone_id="" cf_dns_record_id=""
+    local cf_domain="" cf_zone_id=""
     echo
     read -rp "绑定 CF 域名隐藏 IP? (Y/n，默认 N): " bind_cf
     if [[ "${bind_cf,,}" == "y" || "${bind_cf,,}" == "yes" ]]; then
@@ -1295,7 +1321,7 @@ do_install_reality() {
         selected_zone=$(prompt_select_zone)
         cf_domain="${selected_zone%%|*}"
         cf_zone_id="${selected_zone##*|}"
-        cf_dns_record_id=$(cf_upsert_dns_unproxied "$cf_zone_id" "$cf_domain" "$address")
+        cf_upsert_dns_unproxied "$cf_zone_id" "$cf_domain" "$address" >/dev/null
         ok "DNS A 记录已创建: $cf_domain -> $address（不开代理）"
     fi
 
@@ -1325,6 +1351,7 @@ do_install_reality() {
     read -rp "确认部署 Reality 直连? (Y/n，默认 Y): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
 
+    do_clean_for_reinstall
     ACTIVE_KERNEL="xray"
     stop_other_kernel "xray"
     config=$(gen_xray_config "$route_json" "$uid")
@@ -1357,7 +1384,7 @@ do_install_udp() {
     local obfs_json obfs_type="" obfs_password="" cong="bbr"
 
     address=$(get_public_ip)
-    net_mode=$(detect_nat)
+    net_mode=$(detect_nat "$address")
     if [[ "$net_mode" == "nat" ]]; then
         warn "检测到 NAT/内网网卡（如 AWS EIP）：公网 IP 未绑定到本机网卡"
         info "请确认云厂商安全组/防火墙已放行 UDP 监听端口入站"
@@ -1451,6 +1478,7 @@ do_install_udp() {
     read -rp "确认部署 $(protocol_label "$protocol")? (Y/n，默认 Y): " confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
 
+    do_clean_for_reinstall
     gen_self_signed_cert "$sni"
     stop_other_kernel "singbox"
     config=$(gen_singbox_config "$route_json" "${uid:-}")
@@ -1479,18 +1507,6 @@ do_install_udp() {
 
 # ── 1. 安装 ──────────────────────────────────────────
 do_install() {
-    local state
-    state=$(load_state 2>/dev/null || true)
-    if [[ -n "$state" ]]; then
-        echo "检测到已有配置 ($(echo "$state" | jq -r '.domain // "?"'))，正在清理旧配置..."
-        do_clean_for_reinstall
-        ok "旧配置已清理"
-    fi
-
-    local net_mode
-    net_mode=$(detect_nat)
-    [[ "$net_mode" == "nat" ]] && info "检测到 NAT 环境（内网 IP）" || info "直连环境"
-
     local protocol
     protocol=$(prompt_protocol)
 
@@ -1548,6 +1564,7 @@ do_install() {
     read -rp "$(echo -e "\033[1;33m确认部署? \033[0m\033[37m(Y/n，默认 Y): \033[0m")" confirm
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || { echo "已取消"; return; }
 
+    do_clean_for_reinstall
     # 先生成证书（如果有 TLS），再配置 xray，最后启动
     if [[ "$tls_enabled" == "true" ]]; then
         gen_origin_cert "$domain"
@@ -1778,41 +1795,7 @@ do_purge() {
     ok "完全卸载完成"
 }
 
-# ── 3. 查看订阅 ──────────────────────────────────────
-do_show() {
-    local state; state=$(load_state 2>/dev/null || true)
-    [[ -n "$state" ]] || { echo "未检测到部署"; return; }
-
-    local protocol kernel
-    protocol=$(echo "$state" | jq -r '.route.protocol // "vless"')
-    kernel=$(echo "$state" | jq -r '.kernel // empty')
-    [[ -n "$kernel" ]] || kernel=$(kernel_for_protocol "$protocol")
-    echo
-    header "═══════════════════════"
-    header "      订阅信息"
-    header "═══════════════════════"
-    echo
-    echo -e "  \033[1;36m协议:\033[0m $(protocol_label "$protocol")"
-    echo -e "  \033[1;36m内核:\033[0m $kernel"
-    if [[ "$protocol" == "reality" ]] || is_udp_protocol "$protocol"; then
-        local cf_domain; cf_domain=$(echo "$state" | jq -r '.route.cf_domain // ""')
-        echo -e "  \033[1;36m节点地址:\033[0m $(echo "$state" | jq -r '.domain')"
-        [[ -n "$cf_domain" ]] && echo -e "  \033[1;36m绑定域名:\033[0m $cf_domain"
-    else
-        echo -e "  \033[1;36m域名:\033[0m $(echo "$state" | jq -r '.domain')"
-    fi
-    local uuid; uuid=$(echo "$state" | jq -r '.uuid // empty')
-    [[ -n "$uuid" ]] && echo -e "  \033[1;36mUUID:\033[0m $uuid"
-    if is_udp_protocol "$protocol"; then
-        echo -e "  \033[1;36m密码:\033[0m $(echo "$state" | jq -r '.route.password // ""')"
-    fi
-    print_share_link "$protocol" "$(echo "$state" | jq -r '.link')"
-    if [[ "$protocol" == "vless" ]]; then
-        print_link "$(build_sub_link "$(echo "$state" | jq -r '.link')")"
-    fi
-    echo
-}
-# ── 4. 修改配置 ──────────────────────────────────────
+# ── 3. 修改配置 ──────────────────────────────────────
 # hy2 / tuic 修改
 do_modify_udp() {
     local state="$1" protocol="$2"
@@ -2382,9 +2365,11 @@ do_update_ports() {
 
 # ── 7. 更新内核（xray / sing-box）───────────────────
 do_update_core() {
+    echo "正在并发检查 xray / sing-box 版本..."
+    check_core_updates
     refresh_active_kernel
     local kernel="$ACTIVE_KERNEL"
-    local unit name current_ver latest_ver
+    local current_ver latest_ver
 
     # 若当前部署是 sing-box，优先更新 sing-box；否则更新 xray
     # 同时提供切换选择
@@ -2400,7 +2385,6 @@ do_update_core() {
 
     case "$choice" in
         1)
-            name="xray"; unit="xray"
             current_ver="$XRAY_UPDATE_CURRENT"
             latest_ver="$XRAY_UPDATE_LATEST"
             if [[ -z "$current_ver" ]]; then
@@ -2435,7 +2419,6 @@ do_update_core() {
             fi
             ;;
         2)
-            name="sing-box"; unit="sing-box"
             current_ver="$SINGBOX_UPDATE_CURRENT"
             latest_ver="$SINGBOX_UPDATE_LATEST"
             if [[ -z "$current_ver" ]]; then
@@ -2474,10 +2457,7 @@ do_update_core() {
     esac
 }
 
-# 兼容旧菜单名
-do_update_xray() { do_update_core; }
-
-# ── 8. 重启代理内核 ──────────────────────────────────
+# ── 7. 重启代理内核 ──────────────────────────────────
 do_restart() {
     refresh_active_kernel
     local unit; unit=$(svc_unit)
@@ -2498,7 +2478,10 @@ do_logs() {
     header "       $unit 运行日志"
     header "═══════════════════════════════════"
     echo
-    journalctl -u "$unit" --no-pager -n 30 --output cat 2>/dev/null || echo "暂无日志"
+    journalctl -u "$unit" --no-pager -n 100 --output cat 2>/dev/null || echo "暂无日志"
+    echo
+    info "实时日志: Ctrl+C 退出跟踪"
+    timeout 15s journalctl -u "$unit" --since "1 minute ago" -f --output cat 2>/dev/null || true
     echo
     read -rp "$(echo -e "\033[1;33m按回车返回\033[0m")"
 }
@@ -2602,8 +2585,6 @@ main() {
     install_deps
     need_cmd curl; need_cmd jq; need_cmd openssl
     ensure_shortcut
-    check_xray_update
-    check_singbox_update
     refresh_active_kernel
 
     while true; do
@@ -2627,10 +2608,8 @@ main() {
         fi
 
         local bbr_status; bbr_status=$(get_bbr_status)
-        local unit; unit=$(svc_unit)
-
         echo
-        echo -e "  \033[1;36mxray-cf\033[0m  \033[2;37m(+sing-box)\033[0m"
+        echo -e "  \033[1;36mxray-singbox-cf\033[0m"
         local info=""
         if [[ -n "$current_domain" ]]; then
             info+="\033[33m$current_domain\033[0m"
@@ -2641,75 +2620,37 @@ main() {
             [[ -n "$net_mode" ]] && info+=" \033[37m[$net_mode]\033[0m"
             info+="  \033[37m|\033[0m  "
         fi
-        if svc_is_active; then
-            info+="$unit \033[32m● 运行中\033[0m"
-        else
-            local has_bin=false
-            case "$ACTIVE_KERNEL" in
-                singbox)
-                    resolve_singbox_binary &>/dev/null && has_bin=true
-                    ;;
-                *)
-                    [[ -x "$XRAY_BINARY" ]] && has_bin=true
-                    ;;
-            esac
-            if [[ "$has_bin" == "true" ]]; then
-                info+="$unit \033[31m● 已关闭\033[0m"
-            else
-                info+="$unit \033[31m● 未安装\033[0m"
-            fi
-        fi
         echo -e "     $info"
-        if svc_is_active; then
-            local ver mem pid uptime
-            if [[ "$ACTIVE_KERNEL" == "singbox" ]]; then
-                ver=$(get_singbox_version || echo "?")
-            else
-                ver=$(get_xray_version || echo "?")
-            fi
-            mem=$(systemctl show "$unit" -p MemoryCurrent --value 2>/dev/null)
-            mem=$(awk -v m="$mem" 'BEGIN{if (m+0==0) print "?"; else if (m>1048576) printf "%.1f MB", m/1048576; else printf "%.1f KB", m/1024}')
-            pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
-            uptime=$(systemctl show "$unit" -p ActiveEnterTimestamp --value 2>/dev/null)
-            uptime=$(date -d "$uptime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$uptime")
-            echo -e "     \033[36mv${ver}\033[0m  \033[33mPID:${pid}\033[0m  \033[35m内存:${mem}\033[0m  \033[37m启动:${uptime}\033[0m"
-        fi
+        echo -e "     $(svc_status_text xray)"
+        print_service_detail xray
+        echo -e "     $(svc_status_text singbox)"
+        print_service_detail singbox
         echo
         echo -e "  \033[1;32m 1\033[0m. 安装节点 \033[2;37m(VLESS/Reality/HY2/TUIC)\033[0m"
         echo -e "  \033[1;31m 2\033[0m. 卸载节点"
-        echo -e "  \033[1;34m 3\033[0m. 查看订阅"
-        echo -e "  \033[1;33m 4\033[0m. 修改配置"
-        echo -e "  \033[1;34m 5\033[0m. 查看当前配置"
-        echo -e "  \033[1;33m 6\033[0m. 更新外部端口 (NAT换端口)"
-        local update_label=""
-        if [[ "$ACTIVE_KERNEL" == "singbox" ]]; then
-            update_label="$SINGBOX_UPDATE_STATUS"
-            [[ -n "$update_label" ]] && update_label=" [sing-box: ${update_label}]"
-            echo -e "  \033[1;35m 7\033[0m. 更新内核\033[33m${update_label}\033[0m"
-        else
-            update_label="$XRAY_UPDATE_STATUS"
-            [[ -n "$update_label" ]] && update_label=" [xray: ${update_label}]"
-            echo -e "  \033[1;35m 7\033[0m. 更新内核\033[33m${update_label}\033[0m"
-        fi
-        echo -e "  \033[1;36m 8\033[0m. 查看日志"
-        echo -e "  \033[1;36m 9\033[0m. 重启服务"
-        echo -e "  \033[1;31m10\033[0m. 完全卸载（含凭证）"
+        echo -e "  \033[1;33m 3\033[0m. 修改配置"
+        echo -e "  \033[1;34m 4\033[0m. 查看当前配置"
+        echo -e "  \033[1;33m 5\033[0m. 更新外部端口 (NAT换端口)"
+        echo -e "  \033[1;35m 6\033[0m. 更新内核 \033[33m(进入后检查版本)\033[0m"
+        echo -e "  \033[1;36m 7\033[0m. 查看日志"
+        echo -e "  \033[1;36m 8\033[0m. 重启服务"
+        echo -e "  \033[1;31m 9\033[0m. 完全卸载（含凭证）"
         local bbr_label="BBR 加速"
         [[ "$bbr_status" == "已启用" ]] && bbr_label+=" (\033[32m$bbr_status\033[0m)" || bbr_label+=" (\033[31m$bbr_status\033[0m)"
-        echo -e "  \033[1;32m11\033[0m. $bbr_label"
+        echo -e "  \033[1;32m10\033[0m. $bbr_label"
         echo -e "  \033[1;31m 0\033[0m. 退出"
         echo
 
-        read -rp "$(echo -e "\033[1;33m请选择 [0-11]: \033[0m")" choice
+        read -rp "$(echo -e "\033[1;33m请选择 [0-10]: \033[0m")" choice
         case "$choice" in
             0) exit 0 ;;
-            1) do_install ;; 2) do_uninstall ;; 3) do_show ;;
-            4) do_modify ;; 5) do_show_config ;; 6) do_update_ports ;;
-            7) do_update_core ;;
-            8) do_logs ;;
-            9) do_restart ;;
-            10) do_purge ;;
-            11) do_bbr ;;
+            1) do_install ;; 2) do_uninstall ;; 3) do_modify ;;
+            4) do_show_config ;; 5) do_update_ports ;;
+            6) do_update_core ;;
+            7) do_logs ;;
+            8) do_restart ;;
+            9) do_purge ;;
+            10) do_bbr ;;
             *) echo "无效选项: $choice，请重新选择"; sleep 1 ;;
         esac
     done
